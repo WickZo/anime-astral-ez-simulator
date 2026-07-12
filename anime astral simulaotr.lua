@@ -20,8 +20,7 @@ local GAMEMODE_JOIN_COOLDOWN = 4
 local RAID_GATE_POLL_INTERVAL = 5
 local AVAILABILITY_WAIT_LOG_INTERVAL = 10
 local RAID_CREATE_JOIN_DELAY = 1
-local FIRE_DUNGEON_GATE_SCAN_RADIUS = 12000
-local FIRE_DUNGEON_GATE_TRY_SECONDS = 4
+local MAX_ESTIMATED_MOB_KILL_SECONDS = 12
 local AUTO_START_ROUTE = false
 local GUI_FULL_HEIGHT = 600
 
@@ -159,10 +158,13 @@ local state = {
     LastAvailabilityWaitLogAt = 0,
     AvailabilityHooksReady = false,
     AvailableGamemodes = {},
+    ResumeGamemodePayload = nil,
+    LastNonFireGamemodePayload = nil,
     SelectedLocations = {},
     SelectedArenaTypes = {
         Dungeon = true,
         Raid = true,
+        Defense = true,
         TimeTrial = true,
     },
     SelectedGamemodes = {},
@@ -648,6 +650,11 @@ local arenaRoots = {
         LeaveBridge = "RaidLeave",
     },
     {
+        RootName = "DefenseArenas",
+        Kind = "Defense",
+        LeaveBridge = "DefenseLeave",
+    },
+    {
         RootName = "TimeTrialArenas",
         Kind = "TimeTrial",
         LeaveBridge = "TimeTrialLeave",
@@ -750,6 +757,35 @@ local function getActiveCombatArena()
     return nil
 end
 
+local function getResumePayloadFromArena(arenaInfo)
+    if not arenaInfo or not arenaInfo.RootInfo or not arenaInfo.Arena then
+        return nil
+    end
+
+    return {
+        NotifyKind = "ResumePrevious",
+        GamemodeType = arenaInfo.RootInfo.Kind,
+        Key = arenaInfo.Arena.Name,
+        Name = arenaInfo.Arena.Name,
+    }
+end
+
+local function rememberResumeGamemode(arenaInfo)
+    if not arenaInfo
+        or (arenaInfo.RootInfo
+            and arenaInfo.RootInfo.Kind == "Dungeon"
+            and arenaInfo.Arena
+            and arenaInfo.Arena.Name == "World9Dungeon") then
+        if type(state.LastNonFireGamemodePayload) == "table" then
+            state.ResumeGamemodePayload = state.LastNonFireGamemodePayload
+        end
+        return
+    end
+
+    state.LastNonFireGamemodePayload = getResumePayloadFromArena(arenaInfo)
+    state.ResumeGamemodePayload = state.LastNonFireGamemodePayload
+end
+
 local function getEnemyTargetPosition(enemy)
     return getModelPosition(enemy)
 end
@@ -803,6 +839,8 @@ local function getCombatMobTimeout(arenaInfo)
 
     if kind == "Raid" then
         return RAID_MOB_TIMEOUT
+    elseif kind == "Defense" then
+        return RAID_MOB_TIMEOUT
     elseif kind == "TimeTrial" then
         return TIME_TRIAL_MOB_TIMEOUT
     end
@@ -842,6 +880,8 @@ local function getGamemodeKind(payload)
         return "Dungeon"
     elseif payload.GamemodeType == "Raid" then
         return "Raid"
+    elseif payload.GamemodeType == "Defense" then
+        return "Defense"
     elseif payload.GamemodeType == "TimeTrial" then
         return "TimeTrial"
     end
@@ -903,6 +943,7 @@ local function setupGamemodeAvailabilityWatchers(Library)
     local bridges = {
         "DungeonAnnouncement",
         "RaidAnnouncement",
+        "DefenseAnnouncement",
         "TimeTrialAnnouncement",
     }
 
@@ -969,7 +1010,7 @@ end
 local function getNextJoinableGamemode()
     cleanAvailableGamemodes()
 
-    local kindOrder = { "Dungeon", "Raid", "TimeTrial" }
+    local kindOrder = { "Dungeon", "Raid", "Defense", "TimeTrial" }
     for _, kind in ipairs(kindOrder) do
         if state.SelectedArenaTypes[kind] ~= false then
             for key, entry in pairs(state.AvailableGamemodes) do
@@ -1115,6 +1156,33 @@ local function createAndJoinRaid(Library, payload)
     return true
 end
 
+local fireGuiButton
+
+local function pressDirectGamemodeYes(kind, key)
+    if type(kind) ~= "string" or type(key) ~= "string" then
+        return false
+    end
+
+    local notifyRoot = playerGui:FindFirstChild("HUD")
+        and playerGui.HUD:FindFirstChild("Main")
+        and playerGui.HUD.Main:FindFirstChild("GamemodeNotify")
+
+    local card = notifyRoot and notifyRoot:FindFirstChild(("Notify_%s_%s"):format(kind, key))
+    local yes = card
+        and card:IsA("GuiObject")
+        and card.Visible
+        and card:FindFirstChild("Actions")
+        and card.Actions:FindFirstChild("YES")
+
+    if yes and yes:IsA("GuiButton") and fireGuiButton(yes) then
+        state.LastGamemodeJoinAt = os.clock()
+        print(("[Potassium] Pressed YES for %s %s."):format(kind, key))
+        return true
+    end
+
+    return false
+end
+
 local function tryJoinGamemode(Library, payload)
     local kind = getGamemodeKind(payload)
     if not kind or not getGamemodeSelection(kind, payload.Key) then
@@ -1127,6 +1195,10 @@ local function tryJoinGamemode(Library, payload)
 
     if os.clock() - (state.LastGamemodeJoinAt or 0) < GAMEMODE_JOIN_COOLDOWN then
         return false
+    end
+
+    if pressDirectGamemodeYes(kind, payload.Key) then
+        return true
     end
 
     local bridgeName
@@ -1169,6 +1241,12 @@ local function tryJoinGamemode(Library, payload)
                 end
             end
         end
+    elseif kind == "Defense" then
+        bridgeName = "DefenseJoin"
+        bridge = Library and Library.getBridge(bridgeName)
+        if bridge then
+            bridge:Fire("Join", payload.Key)
+        end
     end
 
     if not bridge then
@@ -1181,7 +1259,37 @@ local function tryJoinGamemode(Library, payload)
     return true
 end
 
-local function fireGuiButton(button)
+local function tryResumePreviousGamemode(Library)
+    local payload = state.ResumeGamemodePayload
+    if type(payload) ~= "table" then
+        return false
+    end
+
+    local kind = getGamemodeKind(payload)
+    if not kind or not payload.Key then
+        state.ResumeGamemodePayload = nil
+        return false
+    end
+
+    local activeArena = getActiveCombatArena()
+    if activeArena
+        and activeArena.RootInfo
+        and activeArena.RootInfo.Kind == kind
+        and activeArena.Arena
+        and activeArena.Arena.Name == payload.Key then
+        state.ResumeGamemodePayload = nil
+        return true
+    end
+
+    if tryJoinGamemode(Library, payload) then
+        print(("[Potassium] Resuming %s %s after Fire City Dungeon."):format(kind, tostring(payload.Key)))
+        return true
+    end
+
+    return false
+end
+
+function fireGuiButton(button)
     if not button then
         return false
     end
@@ -1280,202 +1388,14 @@ local function isRememberedFireCityDungeonOpen()
         and os.clock() <= (entry.ExpiresAt or 0)
 end
 
-local function getFireDungeonGateText(instance)
-    local texts = {}
-
-    for _, descendant in ipairs(instance:GetDescendants()) do
-        if descendant:IsA("TextLabel") or descendant:IsA("TextButton") then
-            local text = tostring(descendant.Text or "")
-            if text ~= "" then
-                table.insert(texts, text)
-            end
-        elseif descendant:IsA("ProximityPrompt") then
-            local text = table.concat({
-                tostring(descendant.ActionText or ""),
-                tostring(descendant.ObjectText or ""),
-            }, " ")
-            if text ~= " " then
-                table.insert(texts, text)
-            end
-        end
-    end
-
-    return table.concat(texts, " "):lower()
-end
-
-local function scoreFireDungeonGateCandidate(instance)
-    local path = instance:GetFullName():lower()
-    local name = instance.Name:lower()
-    local text = getFireDungeonGateText(instance)
-    local score = 0
-
-    for _, source in ipairs({ path, name, text }) do
-        if source:find("world9dungeon", 1, true) then
-            score += 80
-        end
-        if source:find("fire city", 1, true) or source:find("firecity", 1, true) then
-            score += 60
-        end
-        if source:find("dungeon", 1, true) then
-            score += 40
-        end
-        if source:find("gate", 1, true) or source:find("portal", 1, true) then
-            score += 25
-        end
-        if source:find("enter", 1, true) or source:find("join", 1, true) or source:find("yes", 1, true) then
-            score += 15
-        end
-        if source:find("locked", 1, true) or source:find("closed", 1, true) then
-            score -= 100
-        end
-    end
-
-    if instance:IsA("ProximityPrompt") then
-        score += instance.Enabled and 35 or -100
-    elseif instance:IsA("ClickDetector") or instance:IsA("TouchTransmitter") then
-        score += 20
-    elseif instance:IsA("BasePart") and instance:GetAttribute("SystemType") == "Dungeon" then
-        score += 90
-        if instance:GetAttribute("SystemDificult") == "Easy" then
-            score += 20
-        end
-    elseif instance:IsA("BasePart") and name == "dungeonstation" then
-        score += 80
-    end
-
-    return score
-end
-
-local function getFireDungeonGatePosition(instance)
-    local candidate = instance
-    if not candidate:IsA("BasePart") then
-        candidate = instance:FindFirstAncestorWhichIsA("BasePart")
-    end
-
-    if candidate then
-        return candidate.Position, candidate
-    end
-
-    local model = instance:FindFirstAncestorWhichIsA("Model")
-    if model then
-        return getModelPosition(model), nil
-    end
-
-    return nil, nil
-end
-
-local function getFireDungeonGateCandidates()
-    local worlds = workspace:FindFirstChild("Worlds")
-    local world9 = worlds and worlds:FindFirstChild("9")
-    local character = player.Character
-    local rootPart = character and character:FindFirstChild("HumanoidRootPart")
-    local candidates = {}
-
-    if not world9 or not rootPart then
-        return candidates
-    end
-
-    for _, instance in ipairs(world9:GetDescendants()) do
-        if instance:IsA("ProximityPrompt")
-            or instance:IsA("ClickDetector")
-            or instance:IsA("TouchTransmitter")
-            or (instance:IsA("BasePart") and (instance.Name == "DungeonStation" or instance:GetAttribute("SystemType") == "Dungeon")) then
-            local score = scoreFireDungeonGateCandidate(instance)
-            local position, part = getFireDungeonGatePosition(instance)
-
-            if score > 0 and position and (position - rootPart.Position).Magnitude <= FIRE_DUNGEON_GATE_SCAN_RADIUS then
-                table.insert(candidates, {
-                    Instance = instance,
-                    Part = part,
-                    Position = position,
-                    Score = score,
-                })
-            end
-        end
-    end
-
-    table.sort(candidates, function(left, right)
-        return left.Score > right.Score
-    end)
-
-    return candidates
-end
-
-local function triggerFireDungeonGateCandidate(candidate)
-    local instance = candidate and candidate.Instance
-    local rootPart = getCharacterRoot()
-
-    if not instance or not rootPart then
-        return false
-    end
-
-    moveCharacterTo(candidate.Position)
-    task.wait(0.25)
-
-    if instance:IsA("ProximityPrompt") and typeof(fireproximityprompt) == "function" then
-        pcall(function()
-            fireproximityprompt(instance, math.max(instance.HoldDuration, 0.1))
-        end)
-        return true
-    elseif instance:IsA("ClickDetector") and typeof(fireclickdetector) == "function" then
-        pcall(function()
-            fireclickdetector(instance)
-        end)
-        return true
-    elseif instance:IsA("TouchTransmitter") and candidate.Part and typeof(firetouchinterest) == "function" then
-        pcall(function()
-            firetouchinterest(rootPart, candidate.Part, 0)
-            task.wait(0.1)
-            firetouchinterest(rootPart, candidate.Part, 1)
-        end)
-        return true
-    elseif instance:IsA("BasePart") then
-        moveCharacterTo(instance.Position)
-        task.wait(0.5)
-        return true
-    elseif candidate.Part then
-        moveCharacterTo(candidate.Part.Position)
-        return true
-    end
-
-    return false
-end
-
-local function tryEnterFireCityDungeonGate(Library)
-    if not requestWorldAndWait(Library, 9) then
-        return false
-    end
-
-    local candidates = getFireDungeonGateCandidates()
-    if #candidates == 0 then
-        return false
-    end
-
-    print(("[Potassium] Trying Fire City Dungeon gate path: %s."):format(candidates[1].Instance:GetFullName()))
-
-    for _, candidate in ipairs(candidates) do
-        if triggerFireDungeonGateCandidate(candidate) then
-            local started = os.clock()
-            repeat
-                if pressVisibleFireCityYes and pressVisibleFireCityYes() then
-                    return true
-                end
-                task.wait(0.25)
-            until os.clock() - started > FIRE_DUNGEON_GATE_TRY_SECONDS or not state.Enabled
-        end
-    end
-
-    return false
-end
-
 function joinFireCityDungeon(Library)
     local bridge = Library and Library.getBridge("DungeonJoin")
     local fired = false
     local rememberedOpen = isRememberedFireCityDungeonOpen()
 
+    rememberResumeGamemode(getActiveCombatArena())
+
     if pressVisibleFireCityYes and pressVisibleFireCityYes() then
-        fired = true
-    elseif tryEnterFireCityDungeonGate(Library) then
         fired = true
     elseif rememberedOpen and tryGamemodeControllerJoin({
         NotifyKind = "GamemodeOpen",
@@ -1551,16 +1471,7 @@ local function getVisibleGamemodeCards()
 end
 
 pressVisibleFireCityYes = function()
-    local directYes = playerGui:FindFirstChild("HUD")
-        and playerGui.HUD:FindFirstChild("Main")
-        and playerGui.HUD.Main:FindFirstChild("GamemodeNotify")
-        and playerGui.HUD.Main.GamemodeNotify:FindFirstChild("Notify_Dungeon_World9Dungeon")
-        and playerGui.HUD.Main.GamemodeNotify.Notify_Dungeon_World9Dungeon:FindFirstChild("Actions")
-        and playerGui.HUD.Main.GamemodeNotify.Notify_Dungeon_World9Dungeon.Actions:FindFirstChild("YES")
-
-    if directYes and directYes:IsA("GuiButton") and fireGuiButton(directYes) then
-        state.LastGamemodeJoinAt = os.clock()
-        print("[Potassium] Pressed Fire City Dungeon YES button.")
+    if pressDirectGamemodeYes("Dungeon", "World9Dungeon") then
         return true
     end
 
@@ -1584,7 +1495,7 @@ local function pressVisibleGamemodeYes(Library)
     end
 
     local cards = getVisibleGamemodeCards()
-    local kindOrder = { "Dungeon", "Raid", "TimeTrial" }
+    local kindOrder = { "Dungeon", "Raid", "Defense", "TimeTrial" }
 
     for _, kind in ipairs(kindOrder) do
         if state.SelectedArenaTypes[kind] ~= false then
@@ -1638,6 +1549,10 @@ local function runDungeonRaidFarm()
     local lastKillAt = os.clock()
     local currentTarget
     local currentTargetHealth
+    local currentTargetStartedAt = 0
+    local currentTargetLastSampleAt = 0
+    local currentTargetLastSampleHealth
+    local observedCombatDps
 
     while state.Enabled and state.DungeonFarmRunning do
         local arenaInfo = getActiveCombatArena()
@@ -1650,7 +1565,9 @@ local function runDungeonRaidFarm()
             lastKillAt = os.clock()
             pollRaidGateState()
 
-            if pressVisibleGamemodeYes(Library) then
+            if tryResumePreviousGamemode(Library) then
+                task.wait(1.25)
+            elseif pressVisibleGamemodeYes(Library) then
                 task.wait(1.25)
             else
                 local openKey, payload = getNextJoinableGamemode()
@@ -1672,9 +1589,16 @@ local function runDungeonRaidFarm()
             print(("[Potassium] Dungeon/Raid farm attached to %s."):format(arenaInfo.Key))
             currentTarget = nil
             currentTargetHealth = nil
+            currentTargetStartedAt = 0
+            currentTargetLastSampleAt = 0
+            currentTargetLastSampleHealth = nil
             observedLiveSet = {}
             lastArenaKey = arenaInfo.Key
             lastKillAt = os.clock()
+        end
+
+        if not isFireCityArena(arenaInfo) then
+            state.LastNonFireGamemodePayload = getResumePayloadFromArena(arenaInfo)
         end
 
         local target, targetHealth, liveEnemies, liveSet = getArenaEnemySnapshot(arenaInfo.Enemies)
@@ -1691,6 +1615,9 @@ local function runDungeonRaidFarm()
             lastKillAt = os.clock()
             currentTarget = nil
             currentTargetHealth = nil
+            currentTargetStartedAt = 0
+            currentTargetLastSampleAt = 0
+            currentTargetLastSampleHealth = nil
             print("[Potassium] Dungeon/Raid mob killed. Timeout reset.")
         end
 
@@ -1707,6 +1634,9 @@ local function runDungeonRaidFarm()
 
             currentTarget = nil
             currentTargetHealth = nil
+            currentTargetStartedAt = 0
+            currentTargetLastSampleAt = 0
+            currentTargetLastSampleHealth = nil
             lastKillAt = os.clock()
             hideAll()
             task.wait(0.35)
@@ -1736,16 +1666,47 @@ local function runDungeonRaidFarm()
         if target and target ~= currentTarget then
             currentTarget = target
             currentTargetHealth = targetHealth
+            currentTargetStartedAt = os.clock()
+            currentTargetLastSampleAt = currentTargetStartedAt
+            currentTargetLastSampleHealth = targetHealth
             print(("[Potassium] Dungeon/Raid target: %s (%s HP)."):format(target.Name, formatHealth(targetHealth)))
         elseif target and type(targetHealth) == "number" then
+            local now = os.clock()
             if type(currentTargetHealth) == "number" and targetHealth < currentTargetHealth then
                 lastKillAt = os.clock()
             end
 
+            if type(currentTargetLastSampleHealth) == "number"
+                and targetHealth < currentTargetLastSampleHealth
+                and now > currentTargetLastSampleAt then
+                local damageDone = currentTargetLastSampleHealth - targetHealth
+                local elapsed = now - currentTargetLastSampleAt
+                local sampleDps = damageDone / elapsed
+
+                if sampleDps > 0 then
+                    observedCombatDps = observedCombatDps and ((observedCombatDps * 0.65) + (sampleDps * 0.35)) or sampleDps
+                end
+            end
+
+            currentTargetLastSampleAt = now
+            currentTargetLastSampleHealth = targetHealth
             currentTargetHealth = targetHealth
         end
 
-        if target then
+        if target and type(targetHealth) == "number" and targetHealth > 0 and type(observedCombatDps) == "number" and observedCombatDps > 0 then
+            local estimatedSeconds = targetHealth / observedCombatDps
+            if estimatedSeconds > MAX_ESTIMATED_MOB_KILL_SECONDS then
+                leaveActiveCombatArena(Library, arenaInfo, ("Estimated %.1fs to kill %s at current DPS"):format(estimatedSeconds, target.Name))
+                state.DungeonFarmRunning = false
+                break
+            end
+        elseif target and currentTargetStartedAt > 0 and os.clock() - currentTargetStartedAt > MAX_ESTIMATED_MOB_KILL_SECONDS then
+            leaveActiveCombatArena(Library, arenaInfo, ("No DPS sample for %s after %ds"):format(target.Name, MAX_ESTIMATED_MOB_KILL_SECONDS))
+            state.DungeonFarmRunning = false
+            break
+        end
+
+        if target and arenaInfo.RootInfo.Kind ~= "Defense" then
             local position = getEnemyTargetPosition(target)
             if position then
                 moveCharacterTo(position)
