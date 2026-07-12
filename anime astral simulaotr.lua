@@ -11,16 +11,16 @@ local WORLD_CHANGE_TIMEOUT = 12
 local TARGET_FIND_TIMEOUT = 8
 local TARGET_DEATH_TIMEOUT = 45
 local TARGET_SEARCH_RADIUS = 5000
-local DUNGEON_MOB_TIMEOUT = 90
+local DUNGEON_MOB_TIMEOUT = 12
 local RAID_MOB_TIMEOUT = 10
 local TIME_TRIAL_MOB_TIMEOUT = 10
+local DEFENSE_MOB_TIMEOUT = 12
 local DUNGEON_SCAN_INTERVAL = 0.15
 local GAMEMODE_OPEN_WINDOW = 60
 local GAMEMODE_JOIN_COOLDOWN = 4
 local RAID_GATE_POLL_INTERVAL = 5
 local AVAILABILITY_WAIT_LOG_INTERVAL = 10
 local RAID_CREATE_JOIN_DELAY = 1
-local MAX_ESTIMATED_MOB_KILL_SECONDS = 12
 local AUTO_START_ROUTE = false
 local GUI_FULL_HEIGHT = 600
 
@@ -138,6 +138,16 @@ local gamemodeOptions = {
         Key = "Medium",
         Name = "Time Trial Medium",
     },
+    {
+        Kind = "Defense",
+        Key = "World4",
+        Name = "Titan Wall Defense",
+    },
+    {
+        Kind = "Defense",
+        Key = "World8",
+        Name = "Beach Defense",
+    },
 }
 
 local old = getgenv and getgenv().PotassiumHideLoading
@@ -158,14 +168,12 @@ local state = {
     LastAvailabilityWaitLogAt = 0,
     AvailabilityHooksReady = false,
     AvailableGamemodes = {},
-    ResumeGamemodePayload = nil,
-    LastNonFireGamemodePayload = nil,
     SelectedLocations = {},
     SelectedArenaTypes = {
         Dungeon = true,
         Raid = true,
-        Defense = true,
         TimeTrial = true,
+        Defense = true,
     },
     SelectedGamemodes = {},
     SelectedGamemodeIds = {},
@@ -176,10 +184,10 @@ for _, option in ipairs(gamemodeOptions) do
     local optionId = option.Kind .. ":" .. option.Key .. (option.GateRank and (":" .. option.GateRank) or "")
     state.SelectedGamemodes[option.Kind] = state.SelectedGamemodes[option.Kind] or {}
     if state.SelectedGamemodes[option.Kind][option.Key] == nil then
-        state.SelectedGamemodes[option.Kind][option.Key] = true
+        state.SelectedGamemodes[option.Kind][option.Key] = false
     end
     if state.SelectedGamemodeIds[optionId] == nil then
-        state.SelectedGamemodeIds[optionId] = true
+        state.SelectedGamemodeIds[optionId] = false
     end
 end
 
@@ -650,14 +658,14 @@ local arenaRoots = {
         LeaveBridge = "RaidLeave",
     },
     {
-        RootName = "DefenseArenas",
-        Kind = "Defense",
-        LeaveBridge = "DefenseLeave",
-    },
-    {
         RootName = "TimeTrialArenas",
         Kind = "TimeTrial",
         LeaveBridge = "TimeTrialLeave",
+    },
+    {
+        RootName = "DefenseArenas",
+        Kind = "Defense",
+        LeaveBridge = "DefenseLeave",
     },
 }
 
@@ -757,35 +765,6 @@ local function getActiveCombatArena()
     return nil
 end
 
-local function getResumePayloadFromArena(arenaInfo)
-    if not arenaInfo or not arenaInfo.RootInfo or not arenaInfo.Arena then
-        return nil
-    end
-
-    return {
-        NotifyKind = "ResumePrevious",
-        GamemodeType = arenaInfo.RootInfo.Kind,
-        Key = arenaInfo.Arena.Name,
-        Name = arenaInfo.Arena.Name,
-    }
-end
-
-local function rememberResumeGamemode(arenaInfo)
-    if not arenaInfo
-        or (arenaInfo.RootInfo
-            and arenaInfo.RootInfo.Kind == "Dungeon"
-            and arenaInfo.Arena
-            and arenaInfo.Arena.Name == "World9Dungeon") then
-        if type(state.LastNonFireGamemodePayload) == "table" then
-            state.ResumeGamemodePayload = state.LastNonFireGamemodePayload
-        end
-        return
-    end
-
-    state.LastNonFireGamemodePayload = getResumePayloadFromArena(arenaInfo)
-    state.ResumeGamemodePayload = state.LastNonFireGamemodePayload
-end
-
 local function getEnemyTargetPosition(enemy)
     return getModelPosition(enemy)
 end
@@ -839,10 +818,10 @@ local function getCombatMobTimeout(arenaInfo)
 
     if kind == "Raid" then
         return RAID_MOB_TIMEOUT
-    elseif kind == "Defense" then
-        return RAID_MOB_TIMEOUT
     elseif kind == "TimeTrial" then
         return TIME_TRIAL_MOB_TIMEOUT
+    elseif kind == "Defense" then
+        return DEFENSE_MOB_TIMEOUT
     end
 
     return DUNGEON_MOB_TIMEOUT
@@ -880,10 +859,10 @@ local function getGamemodeKind(payload)
         return "Dungeon"
     elseif payload.GamemodeType == "Raid" then
         return "Raid"
-    elseif payload.GamemodeType == "Defense" then
-        return "Defense"
     elseif payload.GamemodeType == "TimeTrial" then
         return "TimeTrial"
+    elseif payload.GamemodeType == "Defense" then
+        return "Defense"
     end
 
     return nil
@@ -943,8 +922,8 @@ local function setupGamemodeAvailabilityWatchers(Library)
     local bridges = {
         "DungeonAnnouncement",
         "RaidAnnouncement",
-        "DefenseAnnouncement",
         "TimeTrialAnnouncement",
+        "DefenseAnnouncement",
     }
 
     for _, bridgeName in ipairs(bridges) do
@@ -1010,7 +989,7 @@ end
 local function getNextJoinableGamemode()
     cleanAvailableGamemodes()
 
-    local kindOrder = { "Dungeon", "Raid", "Defense", "TimeTrial" }
+    local kindOrder = { "Dungeon", "Raid", "TimeTrial", "Defense" }
     for _, kind in ipairs(kindOrder) do
         if state.SelectedArenaTypes[kind] ~= false then
             for key, entry in pairs(state.AvailableGamemodes) do
@@ -1031,6 +1010,20 @@ local function getNextJoinableGamemode()
             return "RaidCreate:" .. option.Key, {
                 NotifyKind = "ManualStart",
                 GamemodeType = "Raid",
+                Key = option.Key,
+                Name = option.Name,
+                CreateFirst = true,
+            }
+        end
+    end
+
+    for _, option in ipairs(gamemodeOptions) do
+        if option.Kind == "Defense"
+            and isGamemodeOptionSelected(option)
+            and getGamemodeSelection(option.Kind, option.Key) then
+            return "DefenseStart:" .. option.Key, {
+                NotifyKind = "ManualStart",
+                GamemodeType = "Defense",
                 Key = option.Key,
                 Name = option.Name,
                 CreateFirst = true,
@@ -1108,6 +1101,22 @@ local function getRaidWorldId(Library, raidKey)
     return parsed and tonumber(parsed) or nil
 end
 
+local function getDefenseWorldId(Library, defenseKey)
+    local ok, defenseConfig = pcall(function()
+        return Library and Library.getConfig("DefenseConfig")
+    end)
+
+    if ok and defenseConfig and type(defenseConfig.GetDefense) == "function" then
+        local defense = defenseConfig:GetDefense(defenseKey)
+        if defense and type(defense.WorldId) == "number" then
+            return defense.WorldId
+        end
+    end
+
+    local parsed = tostring(defenseKey):match("^World(%d+)$")
+    return parsed and tonumber(parsed) or nil
+end
+
 local function requestWorldAndWait(Library, worldId)
     if type(worldId) ~= "number" then
         return true
@@ -1156,31 +1165,28 @@ local function createAndJoinRaid(Library, payload)
     return true
 end
 
-local fireGuiButton
-
-local function pressDirectGamemodeYes(kind, key)
-    if type(kind) ~= "string" or type(key) ~= "string" then
+local function startOrJoinDefense(Library, payload)
+    local bridge = Library and Library.getBridge("DefenseJoin")
+    if not bridge then
+        warn("[Potassium] Could not find DefenseJoin for defense start.")
         return false
     end
 
-    local notifyRoot = playerGui:FindFirstChild("HUD")
-        and playerGui.HUD:FindFirstChild("Main")
-        and playerGui.HUD.Main:FindFirstChild("GamemodeNotify")
-
-    local card = notifyRoot and notifyRoot:FindFirstChild(("Notify_%s_%s"):format(kind, key))
-    local yes = card
-        and card:IsA("GuiObject")
-        and card.Visible
-        and card:FindFirstChild("Actions")
-        and card.Actions:FindFirstChild("YES")
-
-    if yes and yes:IsA("GuiButton") and fireGuiButton(yes) then
-        state.LastGamemodeJoinAt = os.clock()
-        print(("[Potassium] Pressed YES for %s %s."):format(kind, key))
-        return true
+    local worldId = getDefenseWorldId(Library, payload.Key)
+    if not requestWorldAndWait(Library, worldId) then
+        warn(("[Potassium] Could not switch to world %s for defense %s."):format(tostring(worldId), tostring(payload.Key)))
+        return false
     end
 
-    return false
+    if payload.CreateFirst == true then
+        bridge:Fire("Create", payload.Key)
+        print(("[Potassium] Starting defense %s via DefenseJoin Create."):format(tostring(payload.Key)))
+        task.wait(RAID_CREATE_JOIN_DELAY)
+    end
+
+    bridge:Fire("Join", payload.Key)
+    print(("[Potassium] Entering defense %s via DefenseJoin Join."):format(tostring(payload.Key)))
+    return true
 end
 
 local function tryJoinGamemode(Library, payload)
@@ -1195,10 +1201,6 @@ local function tryJoinGamemode(Library, payload)
 
     if os.clock() - (state.LastGamemodeJoinAt or 0) < GAMEMODE_JOIN_COOLDOWN then
         return false
-    end
-
-    if pressDirectGamemodeYes(kind, payload.Key) then
-        return true
     end
 
     local bridgeName
@@ -1242,11 +1244,12 @@ local function tryJoinGamemode(Library, payload)
             end
         end
     elseif kind == "Defense" then
-        bridgeName = "DefenseJoin"
-        bridge = Library and Library.getBridge(bridgeName)
-        if bridge then
-            bridge:Fire("Join", payload.Key)
+        if startOrJoinDefense(Library, payload) then
+            state.LastGamemodeJoinAt = os.clock()
+            return true
         end
+
+        return false
     end
 
     if not bridge then
@@ -1259,37 +1262,7 @@ local function tryJoinGamemode(Library, payload)
     return true
 end
 
-local function tryResumePreviousGamemode(Library)
-    local payload = state.ResumeGamemodePayload
-    if type(payload) ~= "table" then
-        return false
-    end
-
-    local kind = getGamemodeKind(payload)
-    if not kind or not payload.Key then
-        state.ResumeGamemodePayload = nil
-        return false
-    end
-
-    local activeArena = getActiveCombatArena()
-    if activeArena
-        and activeArena.RootInfo
-        and activeArena.RootInfo.Kind == kind
-        and activeArena.Arena
-        and activeArena.Arena.Name == payload.Key then
-        state.ResumeGamemodePayload = nil
-        return true
-    end
-
-    if tryJoinGamemode(Library, payload) then
-        print(("[Potassium] Resuming %s %s after Fire City Dungeon."):format(kind, tostring(payload.Key)))
-        return true
-    end
-
-    return false
-end
-
-function fireGuiButton(button)
+local function fireGuiButton(button)
     if not button then
         return false
     end
@@ -1378,44 +1351,29 @@ local function tryGamemodeControllerJoin(payload)
     return joinOk == true
 end
 
-local function isRememberedFireCityDungeonOpen()
-    local entry = state.AvailableGamemodes["Dungeon:World9Dungeon"]
-
-    return type(entry) == "table"
-        and entry.Kind == "Dungeon"
-        and type(entry.Payload) == "table"
-        and entry.Payload.Key == "World9Dungeon"
-        and os.clock() <= (entry.ExpiresAt or 0)
-end
-
 function joinFireCityDungeon(Library)
     local bridge = Library and Library.getBridge("DungeonJoin")
     local fired = false
-    local rememberedOpen = isRememberedFireCityDungeonOpen()
-
-    rememberResumeGamemode(getActiveCombatArena())
 
     if pressVisibleFireCityYes and pressVisibleFireCityYes() then
         fired = true
-    elseif rememberedOpen and tryGamemodeControllerJoin({
+    elseif tryGamemodeControllerJoin({
         NotifyKind = "GamemodeOpen",
         GamemodeType = "Dungeon",
         Key = "World9Dungeon",
         Name = "Fire City Dungeon",
     }) then
         fired = true
-    elseif rememberedOpen and bridge then
+    elseif bridge then
         bridge:Fire("Join", "World9Dungeon")
         fired = true
-    elseif rememberedOpen and fireRawBridgeName("DungeonJoin", "Join", "World9Dungeon") then
+    elseif fireRawBridgeName("DungeonJoin", "Join", "World9Dungeon") then
         fired = true
     end
 
     if fired then
         state.LastGamemodeJoinAt = os.clock()
         print("[Potassium] Fired Fire City Dungeon join remote: DungeonJoin Join World9Dungeon.")
-    elseif not rememberedOpen then
-        print("[Potassium] Fire City Dungeon is locked; waiting for open card/gate.")
     else
         warn("[Potassium] Could not fire Fire City Dungeon join remote.")
     end
@@ -1428,42 +1386,69 @@ local function getVisibleGamemodeCards()
     local main = hud and hud:FindFirstChild("Main")
     local notifyRoot = main and main:FindFirstChild("GamemodeNotify")
     local cards = {}
+    local addedCards = {}
+    local ignoredNotifyChildren = {
+        UIListLayout = true,
+        HideLeft = true,
+        HideRight = true,
+        NotifyTemplate = true,
+    }
 
     if not notifyRoot then
         return cards
     end
 
+    local function addCard(card, payload)
+        if not card or addedCards[card] or not card:IsA("GuiObject") or not card.Visible then
+            return
+        end
+
+        local kind = getGamemodeKind(payload)
+        local actions = card:FindFirstChild("Actions")
+        local yes = actions and actions:FindFirstChild("YES")
+        local description = card:FindFirstChild("Description")
+        local descriptionText = description and description:IsA("TextLabel") and description.Text or ""
+        local gateRank = descriptionText:match("[Gg]ate%s+[Rr]ank%s*([EDCB])")
+            or descriptionText:match("[Rr]ank%s*([EDCB])")
+
+        if kind and yes and yes:IsA("GuiButton") then
+            if kind == "Raid" and payload.Key == "World5" and gateRank then
+                payload.GateRank = gateRank
+                payload.Rank = gateRank
+            end
+
+            addedCards[card] = true
+            table.insert(cards, {
+                Kind = kind,
+                Payload = payload,
+                Button = yes,
+                Card = card,
+                Description = descriptionText,
+            })
+        end
+    end
+
+    local directTimeTrialCards = {
+        Notify_TimeTrial_Easy = "Easy",
+        Notify_TimeTrial_Medium = "Medium",
+    }
+
+    for cardName, key in pairs(directTimeTrialCards) do
+        addCard(notifyRoot:FindFirstChild(cardName), {
+            NotifyKind = "GamemodeOpen",
+            GamemodeType = "TimeTrial",
+            Key = key,
+        })
+    end
+
     for _, card in ipairs(notifyRoot:GetChildren()) do
-        if card:IsA("GuiObject") and card.Visible and card.Name ~= "NotifyTemplate" then
+        if not ignoredNotifyChildren[card.Name] and card:IsA("GuiObject") and card.Visible then
             local gamemodeType, key = card.Name:match("^Notify_([^_]+)_(.+)$")
-            local payload = {
+            addCard(card, {
                 NotifyKind = "GamemodeOpen",
                 GamemodeType = gamemodeType,
                 Key = key,
-            }
-
-            local kind = getGamemodeKind(payload)
-            local actions = card:FindFirstChild("Actions")
-            local yes = actions and actions:FindFirstChild("YES")
-            local description = card:FindFirstChild("Description")
-            local descriptionText = description and description:IsA("TextLabel") and description.Text or ""
-            local gateRank = descriptionText:match("[Gg]ate%s+[Rr]ank%s*([EDCB])")
-                or descriptionText:match("[Rr]ank%s*([EDCB])")
-
-            if kind and yes and yes:IsA("GuiButton") then
-                if kind == "Raid" and payload.Key == "World5" and gateRank then
-                    payload.GateRank = gateRank
-                    payload.Rank = gateRank
-                end
-
-                table.insert(cards, {
-                    Kind = kind,
-                    Payload = payload,
-                    Button = yes,
-                    Card = card,
-                    Description = descriptionText,
-                })
-            end
+            })
         end
     end
 
@@ -1471,10 +1456,6 @@ local function getVisibleGamemodeCards()
 end
 
 pressVisibleFireCityYes = function()
-    if pressDirectGamemodeYes("Dungeon", "World9Dungeon") then
-        return true
-    end
-
     for _, cardInfo in ipairs(getVisibleGamemodeCards()) do
         if cardInfo.Kind == "Dungeon"
             and (cardInfo.Payload.Key == "World9Dungeon" or tostring(cardInfo.Description):lower():find("fire city", 1, true)) then
@@ -1495,7 +1476,7 @@ local function pressVisibleGamemodeYes(Library)
     end
 
     local cards = getVisibleGamemodeCards()
-    local kindOrder = { "Dungeon", "Raid", "Defense", "TimeTrial" }
+    local kindOrder = { "Dungeon", "Raid", "TimeTrial", "Defense" }
 
     for _, kind in ipairs(kindOrder) do
         if state.SelectedArenaTypes[kind] ~= false then
@@ -1549,10 +1530,6 @@ local function runDungeonRaidFarm()
     local lastKillAt = os.clock()
     local currentTarget
     local currentTargetHealth
-    local currentTargetStartedAt = 0
-    local currentTargetLastSampleAt = 0
-    local currentTargetLastSampleHealth
-    local observedCombatDps
 
     while state.Enabled and state.DungeonFarmRunning do
         local arenaInfo = getActiveCombatArena()
@@ -1565,9 +1542,7 @@ local function runDungeonRaidFarm()
             lastKillAt = os.clock()
             pollRaidGateState()
 
-            if tryResumePreviousGamemode(Library) then
-                task.wait(1.25)
-            elseif pressVisibleGamemodeYes(Library) then
+            if pressVisibleGamemodeYes(Library) then
                 task.wait(1.25)
             else
                 local openKey, payload = getNextJoinableGamemode()
@@ -1589,16 +1564,9 @@ local function runDungeonRaidFarm()
             print(("[Potassium] Dungeon/Raid farm attached to %s."):format(arenaInfo.Key))
             currentTarget = nil
             currentTargetHealth = nil
-            currentTargetStartedAt = 0
-            currentTargetLastSampleAt = 0
-            currentTargetLastSampleHealth = nil
             observedLiveSet = {}
             lastArenaKey = arenaInfo.Key
             lastKillAt = os.clock()
-        end
-
-        if not isFireCityArena(arenaInfo) then
-            state.LastNonFireGamemodePayload = getResumePayloadFromArena(arenaInfo)
         end
 
         local target, targetHealth, liveEnemies, liveSet = getArenaEnemySnapshot(arenaInfo.Enemies)
@@ -1615,28 +1583,14 @@ local function runDungeonRaidFarm()
             lastKillAt = os.clock()
             currentTarget = nil
             currentTargetHealth = nil
-            currentTargetStartedAt = 0
-            currentTargetLastSampleAt = 0
-            currentTargetLastSampleHealth = nil
             print("[Potassium] Dungeon/Raid mob killed. Timeout reset.")
         end
 
         observedLiveSet = liveSet
 
         if #liveEnemies == 0 then
-            if isFireCityArena(arenaInfo) and not isFireCityActuallyJoined(nil) then
-                if os.clock() - (state.LastGamemodeJoinAt or 0) >= GAMEMODE_JOIN_COOLDOWN then
-                    if not pressVisibleFireCityYes() then
-                        joinFireCityDungeon(Library)
-                    end
-                end
-            end
-
             currentTarget = nil
             currentTargetHealth = nil
-            currentTargetStartedAt = 0
-            currentTargetLastSampleAt = 0
-            currentTargetLastSampleHealth = nil
             lastKillAt = os.clock()
             hideAll()
             task.wait(0.35)
@@ -1644,13 +1598,19 @@ local function runDungeonRaidFarm()
         end
 
         if isFireCityArena(arenaInfo) and target and not isFireCityActuallyJoined(target) then
+            local mobTimeout = getCombatMobTimeout(arenaInfo)
+            if os.clock() - lastKillAt > mobTimeout then
+                leaveActiveCombatArena(Library, arenaInfo, ("Could not confirm Fire City join for %ds"):format(mobTimeout))
+                state.DungeonFarmRunning = false
+                break
+            end
+
             if os.clock() - (state.LastGamemodeJoinAt or 0) >= GAMEMODE_JOIN_COOLDOWN then
                 if not pressVisibleFireCityYes() then
                     joinFireCityDungeon(Library)
                 end
             end
 
-            lastKillAt = os.clock()
             hideAll()
             task.wait(0.5)
             continue
@@ -1658,7 +1618,7 @@ local function runDungeonRaidFarm()
 
         local mobTimeout = getCombatMobTimeout(arenaInfo)
         if os.clock() - lastKillAt > mobTimeout then
-            leaveActiveCombatArena(Library, arenaInfo, ("No kill/progress for %ds"):format(mobTimeout))
+            leaveActiveCombatArena(Library, arenaInfo, ("No kill for %ds"):format(mobTimeout))
             state.DungeonFarmRunning = false
             break
         end
@@ -1666,47 +1626,12 @@ local function runDungeonRaidFarm()
         if target and target ~= currentTarget then
             currentTarget = target
             currentTargetHealth = targetHealth
-            currentTargetStartedAt = os.clock()
-            currentTargetLastSampleAt = currentTargetStartedAt
-            currentTargetLastSampleHealth = targetHealth
             print(("[Potassium] Dungeon/Raid target: %s (%s HP)."):format(target.Name, formatHealth(targetHealth)))
         elseif target and type(targetHealth) == "number" then
-            local now = os.clock()
-            if type(currentTargetHealth) == "number" and targetHealth < currentTargetHealth then
-                lastKillAt = os.clock()
-            end
-
-            if type(currentTargetLastSampleHealth) == "number"
-                and targetHealth < currentTargetLastSampleHealth
-                and now > currentTargetLastSampleAt then
-                local damageDone = currentTargetLastSampleHealth - targetHealth
-                local elapsed = now - currentTargetLastSampleAt
-                local sampleDps = damageDone / elapsed
-
-                if sampleDps > 0 then
-                    observedCombatDps = observedCombatDps and ((observedCombatDps * 0.65) + (sampleDps * 0.35)) or sampleDps
-                end
-            end
-
-            currentTargetLastSampleAt = now
-            currentTargetLastSampleHealth = targetHealth
             currentTargetHealth = targetHealth
         end
 
-        if target and type(targetHealth) == "number" and targetHealth > 0 and type(observedCombatDps) == "number" and observedCombatDps > 0 then
-            local estimatedSeconds = targetHealth / observedCombatDps
-            if estimatedSeconds > MAX_ESTIMATED_MOB_KILL_SECONDS then
-                leaveActiveCombatArena(Library, arenaInfo, ("Estimated %.1fs to kill %s at current DPS"):format(estimatedSeconds, target.Name))
-                state.DungeonFarmRunning = false
-                break
-            end
-        elseif target and currentTargetStartedAt > 0 and os.clock() - currentTargetStartedAt > MAX_ESTIMATED_MOB_KILL_SECONDS then
-            leaveActiveCombatArena(Library, arenaInfo, ("No DPS sample for %s after %ds"):format(target.Name, MAX_ESTIMATED_MOB_KILL_SECONDS))
-            state.DungeonFarmRunning = false
-            break
-        end
-
-        if target and arenaInfo.RootInfo.Kind ~= "Defense" then
+        if target then
             local position = getEnemyTargetPosition(target)
             if position then
                 moveCharacterTo(position)
@@ -1901,6 +1826,7 @@ local function buildRouteGui()
         Raid = true,
         Gate = true,
         TimeTrial = true,
+        Defense = true,
     }
     state.ModeFilter = filterNames[state.ModeFilter] and state.ModeFilter or "All"
     local activeModeFilter = state.ModeFilter
@@ -1919,6 +1845,8 @@ local function buildRouteGui()
             return option.Kind == "Raid" and option.Key == "World5"
         elseif activeModeFilter == "TimeTrial" then
             return option.Kind == "TimeTrial"
+        elseif activeModeFilter == "Defense" then
+            return option.Kind == "Defense"
         end
 
         return true
@@ -2080,11 +2008,12 @@ local function buildRouteGui()
         filterButtons[name] = button
     end
 
-    makeFilterButton("All", "All", 0, 308, 42)
-    makeFilterButton("Dungeon", "Dgn", 48, 308, 46)
-    makeFilterButton("Raid", "Raid", 100, 308, 46)
-    makeFilterButton("Gate", "Gate", 152, 308, 46)
-    makeFilterButton("TimeTrial", "Trial", 204, 308, 62)
+    makeFilterButton("All", "All", 0, 308, 34)
+    makeFilterButton("Dungeon", "Dgn", 38, 308, 42)
+    makeFilterButton("Raid", "Raid", 84, 308, 42)
+    makeFilterButton("Gate", "Gate", 130, 308, 42)
+    makeFilterButton("TimeTrial", "Trial", 176, 308, 50)
+    makeFilterButton("Defense", "Def", 230, 308, 36)
 
     modeList = Instance.new("ScrollingFrame")
     modeList.Name = "ModeList"
