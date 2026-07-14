@@ -10,12 +10,11 @@ local WORLD_CHANGE_TIMEOUT = 12
 local TARGET_FIND_TIMEOUT = 8
 local TARGET_DEATH_TIMEOUT = 45
 local TARGET_SEARCH_RADIUS = 5000
-local DUNGEON_MOB_TIMEOUT = 12
-local RAID_MOB_TIMEOUT = 10
-local TIME_TRIAL_MOB_TIMEOUT = 10
-local DEFENSE_MOB_TIMEOUT = 6
+local UNIVERSAL_COMBAT_TIMEOUT = 6
 local WAVE_TRANSITION_TIMEOUT = 30
-local GATE_RAID_STALL_TIMEOUT = 300
+local GATE_FINAL_WAVE = 50
+local GATE_COMPLETION_RETURN_GRACE = 1.25
+local GATE_AUTO_ARISE_RETRY_INTERVAL = 1
 local DUNGEON_SCAN_INTERVAL = 0.15
 local FIRE_CITY_GUI_SCAN_INTERVAL = 0.5
 local GAMEMODE_GUI_SCAN_INTERVAL = 0.5
@@ -181,12 +180,20 @@ local state = {
     GamemodeActionBusy = false,
     AvailabilityHooksReady = false,
     WatchedAvailabilityBridges = {},
+    RaidLifecycleHooksReady = false,
+    WatchedRaidLifecycleBridges = {},
     AvailableGamemodes = {},
     PendingResumeGamemode = nil,
     GateOccurrenceRank = nil,
     GateOccurrenceClosesAt = 0,
     ConsumedGateRank = nil,
     ConsumedGateUntil = 0,
+    LastAutoAriseAttemptAt = 0,
+    LatestRaidState = nil,
+    LatestRaidStateAt = 0,
+    LatestRaidContextKey = nil,
+    GateCompletionReady = false,
+    GateCompletionAt = 0,
     LastJoinedPromptCards = {},
     SuppressedGamemodePrompts = {},
     HookedGuiObjects = setmetatable({}, { __mode = "k" }),
@@ -1443,21 +1450,7 @@ local function waitAfterLeavingTitanForPriority(arenaInfo)
 end
 
 local function getCombatMobTimeout(arenaInfo)
-    local kind = arenaInfo and arenaInfo.RootInfo and arenaInfo.RootInfo.Kind
-
-    if kind == "Raid" then
-        if arenaInfo.Arena and arenaInfo.Arena.Name == "World5" then
-            return GATE_RAID_STALL_TIMEOUT
-        end
-
-        return RAID_MOB_TIMEOUT
-    elseif kind == "TimeTrial" then
-        return TIME_TRIAL_MOB_TIMEOUT
-    elseif kind == "Defense" then
-        return DEFENSE_MOB_TIMEOUT
-    end
-
-    return DUNGEON_MOB_TIMEOUT
+    return UNIVERSAL_COMBAT_TIMEOUT
 end
 
 local function isFireCityArena(arenaInfo)
@@ -2074,6 +2067,149 @@ local function fireGuiButton(button)
     return pressGuiButton(button)
 end
 
+local function isGateRaidArena(arenaInfo)
+    return arenaInfo
+        and arenaInfo.RootInfo
+        and arenaInfo.RootInfo.Kind == "Raid"
+        and arenaInfo.Arena
+        and arenaInfo.Arena.Name == "World5"
+end
+
+local function clearGateCompletionState()
+    state.LatestRaidState = nil
+    state.LatestRaidStateAt = 0
+    state.LatestRaidContextKey = nil
+    state.GateCompletionReady = false
+    state.GateCompletionAt = 0
+end
+
+local function ensureGateAutoArise(Library, arenaInfo)
+    if not isGateRaidArena(arenaInfo) then
+        return false
+    end
+
+    local contextKind, contextKey = getCombatVisibilityContext()
+    if contextKind ~= "Raid" or contextKey ~= "World5" then
+        return false
+    end
+
+    local raidGui = playerGui:FindFirstChild("RaidGui")
+    local main = raidGui and raidGui:FindFirstChild("Main")
+    local autoArise = main and main:FindFirstChild("AutoArise")
+    local onButton = autoArise and autoArise:FindFirstChild("ON")
+    local offButton = autoArise and autoArise:FindFirstChild("OFF")
+
+    if not raidGui or not raidGui.Enabled or not autoArise or not autoArise.Visible then
+        return false
+    end
+
+    if onButton and onButton:IsA("GuiObject") and onButton.Visible then
+        return true
+    end
+
+    if not offButton or not offButton:IsA("GuiButton") or not offButton.Visible then
+        return false
+    end
+
+    local now = os.clock()
+    if now - (state.LastAutoAriseAttemptAt or 0) < GATE_AUTO_ARISE_RETRY_INTERVAL then
+        return false
+    end
+
+    state.LastAutoAriseAttemptAt = now
+    if fireGuiButton(offButton) then
+        print("[Potassium] Enabled Gate Auto Arise through RaidGui.Main.AutoArise.OFF.")
+        return true
+    end
+
+    local autoAriseBridge = Library and Library.getBridge("RaidAutoArise")
+    if autoAriseBridge then
+        autoAriseBridge:Fire(true)
+        print("[Potassium] Enabled Gate Auto Arise through RaidAutoArise fallback.")
+        return true
+    end
+
+    return false
+end
+
+local function setupRaidLifecycleWatchers(Library)
+    if state.RaidLifecycleHooksReady then
+        return
+    end
+
+    local allReady = true
+    local raidStateBridge = Library and Library.getBridge("RaidState")
+    local raidEndedBridge = Library and Library.getBridge("RaidEnded")
+
+    if not state.WatchedRaidLifecycleBridges.RaidState then
+        if raidStateBridge then
+            addConnection(raidStateBridge:Connect(function(payload)
+                if type(payload) ~= "table" then
+                    return
+                end
+
+                local contextKind, contextKey = getCombatVisibilityContext()
+                state.LatestRaidState = payload
+                state.LatestRaidStateAt = os.clock()
+                state.LatestRaidContextKey = contextKind == "Raid" and contextKey or nil
+
+                if contextKind ~= "Raid" or contextKey ~= "World5" then
+                    return
+                end
+
+                local wave = tonumber(payload.Wave)
+                local totalWaves = tonumber(payload.TotalWaves)
+                local enemyCount = tonumber(payload.EnemyCount)
+                local nextWaveDelay = tonumber(payload.TimeToNextWave) or 0
+                local reachedFinalWave = wave
+                    and wave >= GATE_FINAL_WAVE
+                    and (not totalWaves or wave >= totalWaves)
+                local finalWaveCleared = reachedFinalWave
+                    and enemyCount
+                    and enemyCount <= 0
+                    and nextWaveDelay <= 0
+
+                if finalWaveCleared and not state.GateCompletionReady then
+                    state.GateCompletionReady = true
+                    state.GateCompletionAt = os.clock()
+                    print(('[Potassium] Gate complete: wave %d/%d has 0 enemies. Waiting for the normal return.'):format(
+                        wave,
+                        totalWaves or GATE_FINAL_WAVE
+                    ))
+                elseif wave and wave < GATE_FINAL_WAVE and state.GateCompletionReady then
+                    state.GateCompletionReady = false
+                    state.GateCompletionAt = 0
+                end
+            end))
+            state.WatchedRaidLifecycleBridges.RaidState = true
+            print("[Potassium] Watching RaidState for Gate wave 50/50 completion.")
+        else
+            allReady = false
+        end
+    end
+
+    if not state.WatchedRaidLifecycleBridges.RaidEnded then
+        if raidEndedBridge then
+            addConnection(raidEndedBridge:Connect(function()
+                if state.LatestRaidContextKey == "World5" or state.GateCompletionReady then
+                    print("[Potassium] Gate RaidEnded received; normal routing can resume.")
+                end
+                clearGateCompletionState()
+            end))
+            state.WatchedRaidLifecycleBridges.RaidEnded = true
+        else
+            allReady = false
+        end
+    end
+
+    state.RaidLifecycleHooksReady = allReady
+    if not allReady and state.Enabled then
+        task.delay(2, function()
+            setupRaidLifecycleWatchers(Library)
+        end)
+    end
+end
+
 local function fireRawBridgeTuple(identifier, ...)
     local bridgeFolder = ReplicatedStorage:FindFirstChild("BridgeNet2")
     local dataRemote = bridgeFolder and bridgeFolder:FindFirstChild("dataRemoteEvent")
@@ -2560,6 +2696,7 @@ local function runDungeonRaidFarmCore()
     end
 
     setupGamemodeAvailabilityWatchers(Library)
+    setupRaidLifecycleWatchers(Library)
     task.spawn(function()
         while state.Enabled and state.DungeonFarmRunning do
             local watcherOk, watcherError = xpcall(function()
@@ -2580,20 +2717,25 @@ local function runDungeonRaidFarmCore()
     local lastKillAt = os.clock()
     local currentTarget
     local currentTargetHealth
-    local arenaMadeProgress = false
     local lastArenaRoom
+    local waitingForMobSpawn = false
 
     while state.Enabled and state.AutoDungeonRaidWanted do
         local arenaInfo = getActiveCombatArena()
 
         if not arenaInfo then
+            local contextKind, contextKey = getCombatVisibilityContext()
+            if state.GateCompletionReady and not (contextKind == "Raid" and contextKey == "World5") then
+                clearGateCompletionState()
+            end
+
             currentTarget = nil
             currentTargetHealth = nil
             observedLiveSet = {}
             lastArenaKey = nil
             lastKillAt = os.clock()
-            arenaMadeProgress = false
             lastArenaRoom = nil
+            waitingForMobSpawn = false
             pollRaidGateState()
 
             if state.GamemodeActionBusy then
@@ -2635,8 +2777,8 @@ local function runDungeonRaidFarmCore()
             observedLiveSet = {}
             lastArenaKey = nil
             lastKillAt = os.clock()
-            arenaMadeProgress = false
             lastArenaRoom = nil
+            waitingForMobSpawn = false
             hideAll()
             task.wait(1.25)
             continue
@@ -2648,6 +2790,38 @@ local function runDungeonRaidFarmCore()
             continue
         end
 
+        if isGateRaidArena(arenaInfo) then
+            ensureGateAutoArise(Library, arenaInfo)
+
+            if state.GateCompletionReady
+                and os.clock() - (state.GateCompletionAt or 0) >= GATE_COMPLETION_RETURN_GRACE then
+                local leftGate = runGamemodeActionLocked("Gate wave 50 completion", function()
+                    return leaveCombatArenaAndWait(
+                        Library,
+                        arenaInfo,
+                        "Gate wave 50/50 complete",
+                        3,
+                        3
+                    )
+                end)
+
+                if leftGate then
+                    print("[Potassium] Gate 50/50 cleared; resumed normal auto-join scanning.")
+                    clearGateCompletionState()
+                    currentTarget = nil
+                    currentTargetHealth = nil
+                    observedLiveSet = {}
+                    lastArenaKey = nil
+                    lastKillAt = os.clock()
+                    lastArenaRoom = nil
+                    waitingForMobSpawn = false
+                    hideAll()
+                    task.wait(0.5)
+                    continue
+                end
+            end
+        end
+
         if arenaInfo.Key ~= lastArenaKey then
             print(("[Potassium] Dungeon/Raid farm attached to %s."):format(arenaInfo.Key))
             currentTarget = nil
@@ -2656,7 +2830,7 @@ local function runDungeonRaidFarmCore()
             lastArenaKey = arenaInfo.Key
             lastKillAt = os.clock()
             lastArenaRoom = arenaInfo.Arena:GetAttribute("CurrentRoom")
-            arenaMadeProgress = type(lastArenaRoom) == "number" and lastArenaRoom > 1
+            waitingForMobSpawn = false
         end
 
         local target, targetHealth, liveEnemies, liveSet = getArenaEnemySnapshot(arenaInfo.Enemies)
@@ -2668,10 +2842,7 @@ local function runDungeonRaidFarmCore()
 
         local killedSomething = false
         local currentArenaRoom = arenaInfo.Arena:GetAttribute("CurrentRoom")
-        local strictKillTimeout = arenaInfo.RootInfo.Kind == "TimeTrial"
-
         if currentArenaRoom ~= nil and lastArenaRoom ~= nil and currentArenaRoom ~= lastArenaRoom then
-            arenaMadeProgress = true
             lastKillAt = os.clock()
             print(("[Potassium] Arena advanced from room %s to %s. Timeout reset."):format(tostring(lastArenaRoom), tostring(currentArenaRoom)))
         end
@@ -2686,7 +2857,6 @@ local function runDungeonRaidFarmCore()
 
         if killedSomething then
             lastKillAt = os.clock()
-            arenaMadeProgress = true
             currentTarget = nil
             currentTargetHealth = nil
             print("[Potassium] Dungeon/Raid mob killed. Timeout reset.")
@@ -2695,18 +2865,22 @@ local function runDungeonRaidFarmCore()
         observedLiveSet = liveSet
         local mobTimeout = getCombatMobTimeout(arenaInfo)
 
+        if #liveEnemies == 0 then
+            if not waitingForMobSpawn then
+                waitingForMobSpawn = true
+                lastKillAt = os.clock()
+            end
+        elseif waitingForMobSpawn then
+            waitingForMobSpawn = false
+            lastKillAt = os.clock()
+            print(('[Potassium] Mob spawned; universal %ds kill timer started.'):format(mobTimeout))
+        end
+
         if target and target ~= currentTarget then
             currentTarget = target
             currentTargetHealth = targetHealth
-            if not strictKillTimeout then
-                lastKillAt = os.clock()
-            end
             print(("[Potassium] Dungeon/Raid target: %s (%s HP)."):format(target.Name, formatHealth(targetHealth)))
         elseif target and type(targetHealth) == "number" then
-            if not strictKillTimeout and type(currentTargetHealth) == "number" and targetHealth < currentTargetHealth then
-                lastKillAt = os.clock()
-                arenaMadeProgress = true
-            end
             currentTargetHealth = targetHealth
         end
 
@@ -2737,10 +2911,7 @@ local function runDungeonRaidFarmCore()
             continue
         end
 
-        local timeoutLimit = mobTimeout
-        if not strictKillTimeout and #liveEnemies == 0 and arenaMadeProgress then
-            timeoutLimit = math.max(timeoutLimit, WAVE_TRANSITION_TIMEOUT)
-        end
+        local timeoutLimit = #liveEnemies == 0 and WAVE_TRANSITION_TIMEOUT or mobTimeout
 
         if os.clock() - lastKillAt > timeoutLimit then
             handleArenaTimeout(Library, arenaInfo, ("No combat progress for %ds"):format(timeoutLimit))
@@ -2749,6 +2920,7 @@ local function runDungeonRaidFarmCore()
             observedLiveSet = {}
             lastArenaKey = nil
             lastKillAt = os.clock()
+            waitingForMobSpawn = false
             task.wait(1.25)
             continue
         end
