@@ -2075,6 +2075,11 @@ local function isGateRaidArena(arenaInfo)
         and arenaInfo.Arena.Name == "World5"
 end
 
+local function isGateRaidContextActive()
+    local contextKind, contextKey = getCombatVisibilityContext()
+    return contextKind == "Raid" and contextKey == "World5"
+end
+
 local function clearGateCompletionState()
     state.LatestRaidState = nil
     state.LatestRaidStateAt = 0
@@ -2084,12 +2089,11 @@ local function clearGateCompletionState()
 end
 
 local function ensureGateAutoArise(Library, arenaInfo)
-    if not isGateRaidArena(arenaInfo) then
+    if arenaInfo and not isGateRaidArena(arenaInfo) then
         return false
     end
 
-    local contextKind, contextKey = getCombatVisibilityContext()
-    if contextKind ~= "Raid" or contextKey ~= "World5" then
+    if not isGateRaidContextActive() then
         return false
     end
 
@@ -2208,6 +2212,37 @@ local function setupRaidLifecycleWatchers(Library)
             setupRaidLifecycleWatchers(Library)
         end)
     end
+end
+
+local function finishCompletedGate(Library, arenaInfo)
+    return runGamemodeActionLocked("Gate wave 50 completion", function()
+        if arenaInfo then
+            return leaveCombatArenaAndWait(
+                Library,
+                arenaInfo,
+                "Gate wave 50/50 complete",
+                3,
+                3
+            )
+        end
+
+        local leaveButton = getArenaLeaveButton("Raid")
+        pressGuiButton(leaveButton)
+
+        if isGateRaidContextActive() then
+            local raidLeave = Library and Library.getBridge("RaidLeave")
+            if raidLeave then
+                raidLeave:Fire()
+            end
+        end
+
+        local started = os.clock()
+        while state.Enabled and isGateRaidContextActive() and os.clock() - started < 3 do
+            task.wait(0.1)
+        end
+
+        return not isGateRaidContextActive()
+    end)
 end
 
 local function fireRawBridgeTuple(identifier, ...)
@@ -2522,6 +2557,10 @@ local function handleExactGamemodePrompt(Library, option)
         end
 
         local arenaInfo = getActiveCombatArena()
+        if isGateRaidContextActive() or isGateRaidArena(arenaInfo) then
+            return false
+        end
+
         local optionPriority = getGamemodePriority(option)
         local currentPriority = arenaInfo and getArenaGamemodePriority(arenaInfo) or nil
         local sameArena = arenaInfo
@@ -2725,6 +2764,30 @@ local function runDungeonRaidFarmCore()
 
         if not arenaInfo then
             local contextKind, contextKey = getCombatVisibilityContext()
+            local gateContextActive = contextKind == "Raid" and contextKey == "World5"
+
+            if gateContextActive then
+                ensureGateAutoArise(Library)
+
+                if state.GateCompletionReady
+                    and os.clock() - (state.GateCompletionAt or 0) >= GATE_COMPLETION_RETURN_GRACE
+                    and finishCompletedGate(Library, nil) then
+                    print("[Potassium] Gate 50/50 cleared without an arena folder; resumed normal auto-join scanning.")
+                    clearGateCompletionState()
+                end
+
+                currentTarget = nil
+                currentTargetHealth = nil
+                observedLiveSet = {}
+                lastArenaKey = nil
+                lastKillAt = os.clock()
+                lastArenaRoom = nil
+                waitingForMobSpawn = false
+                hideAll()
+                task.wait(0.25)
+                continue
+            end
+
             if state.GateCompletionReady and not (contextKind == "Raid" and contextKey == "World5") then
                 clearGateCompletionState()
             end
@@ -2768,7 +2831,10 @@ local function runDungeonRaidFarmCore()
         end
 
         local currentArenaPriority = getArenaGamemodePriority(arenaInfo)
-        local higherPriorityOption = getExactSelectedGamemodeOption(currentArenaPriority)
+        local higherPriorityOption
+        if not isGateRaidArena(arenaInfo) then
+            higherPriorityOption = getExactSelectedGamemodeOption(currentArenaPriority)
+        end
         if higherPriorityOption then
             handleExactGamemodePrompt(Library, higherPriorityOption)
 
@@ -2795,15 +2861,7 @@ local function runDungeonRaidFarmCore()
 
             if state.GateCompletionReady
                 and os.clock() - (state.GateCompletionAt or 0) >= GATE_COMPLETION_RETURN_GRACE then
-                local leftGate = runGamemodeActionLocked("Gate wave 50 completion", function()
-                    return leaveCombatArenaAndWait(
-                        Library,
-                        arenaInfo,
-                        "Gate wave 50/50 complete",
-                        3,
-                        3
-                    )
-                end)
+                local leftGate = finishCompletedGate(Library, arenaInfo)
 
                 if leftGate then
                     print("[Potassium] Gate 50/50 cleared; resumed normal auto-join scanning.")
@@ -2824,6 +2882,9 @@ local function runDungeonRaidFarmCore()
 
         if arenaInfo.Key ~= lastArenaKey then
             print(("[Potassium] Dungeon/Raid farm attached to %s."):format(arenaInfo.Key))
+            if isGateRaidArena(arenaInfo) then
+                print("[Potassium] Gate session locked: generic timeout and priority preemption are disabled until 50/50 or RaidEnded.")
+            end
             currentTarget = nil
             currentTargetHealth = nil
             observedLiveSet = {}
@@ -2911,7 +2972,9 @@ local function runDungeonRaidFarmCore()
             continue
         end
 
-        local timeoutLimit = #liveEnemies == 0 and WAVE_TRANSITION_TIMEOUT or mobTimeout
+        local timeoutLimit = isGateRaidArena(arenaInfo)
+            and math.huge
+            or (#liveEnemies == 0 and WAVE_TRANSITION_TIMEOUT or mobTimeout)
 
         if os.clock() - lastKillAt > timeoutLimit then
             handleArenaTimeout(Library, arenaInfo, ("No combat progress for %ds"):format(timeoutLimit))
