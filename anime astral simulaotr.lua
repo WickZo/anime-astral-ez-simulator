@@ -160,6 +160,7 @@ local gamemodeOptions = {
 
 local old = getgenv and getgenv().PotassiumHideLoading
 local restartDungeonFarmAfterReload = type(old) == "table" and (old.AutoDungeonRaidWanted == true or old.DungeonFarmRunning == true)
+local restartRouteAfterReload = type(old) == "table" and old.RouteRunning == true
 if old and old.Disconnect then
     pcall(function()
         old:Disconnect()
@@ -170,6 +171,7 @@ local state = {
     Enabled = true,
     Connections = {},
     RouteRunning = false,
+    RoutePausedForAutoJoin = false,
     DungeonFarmRunning = false,
     AutoDungeonRaidWanted = false,
     LastDungeonToggleAt = 0,
@@ -580,6 +582,50 @@ local function moveCharacterTo(position)
     return true
 end
 
+local function shouldPauseWorldRouteForAutoJoin()
+    if not state.AutoDungeonRaidWanted then
+        return false
+    end
+
+    if state.GamemodeActionBusy
+        or state.PendingResumeGamemode ~= nil
+        or os.clock() - (state.LastGamemodeJoinAt or 0) < PRIORITY_JOIN_CONFIRM_TIMEOUT then
+        return true
+    end
+
+    local context = player:GetAttribute("VisibilityContext")
+    local kind = type(context) == "string" and context:match("^([^:]+):") or nil
+    return kind == "Dungeon"
+        or kind == "Raid"
+        or kind == "Trial"
+        or kind == "TimeTrial"
+        or kind == "Defense"
+end
+
+local function waitForWorldRouteResume()
+    if not shouldPauseWorldRouteForAutoJoin() then
+        state.RoutePausedForAutoJoin = false
+        return state.Enabled and state.RouteRunning, false
+    end
+
+    if not state.RoutePausedForAutoJoin then
+        state.RoutePausedForAutoJoin = true
+        print("[Potassium] World Route paused while Auto Join owns movement.")
+    end
+
+    while state.Enabled and state.RouteRunning and shouldPauseWorldRouteForAutoJoin() do
+        hideAll()
+        task.wait(0.1)
+    end
+
+    local canResume = state.Enabled and state.RouteRunning
+    if canResume then
+        print("[Potassium] World Route resumed after Auto Join released movement.")
+    end
+    state.RoutePausedForAutoJoin = false
+    return canResume, true
+end
+
 local function normalizeName(name)
     local normalized = tostring(name):lower():gsub("%s+", "")
     return normalized
@@ -721,6 +767,13 @@ local function waitForTargetDeath(location)
     local findStarted = os.clock()
 
     repeat
+        local canResume, interrupted = waitForWorldRouteResume()
+        if not canResume then
+            return false, false
+        elseif interrupted then
+            return false, true
+        end
+
         enemy, distance, exactMatch = findTargetEnemy(location, false)
 
         if enemy then
@@ -738,7 +791,7 @@ local function waitForTargetDeath(location)
         else
             warn(("[Potassium] Could not find target HP for %s. Using fallback wait."):format(location.Name))
             task.wait(WAIT_AT_LOCATION)
-            return false
+            return false, false
         end
     end
 
@@ -754,28 +807,35 @@ local function waitForTargetDeath(location)
 
     local deathStarted = os.clock()
     while state.Enabled and state.RouteRunning do
+        local canResume, interrupted = waitForWorldRouteResume()
+        if not canResume then
+            return false, false
+        elseif interrupted then
+            return false, true
+        end
+
         if not enemy.Parent then
             print(("[Potassium] %s disappeared. Moving on."):format(location.Name))
-            return true
+            return true, false
         end
 
         health, maxHealth, dead = getEnemyHealth(enemy)
 
         if dead or (type(health) == "number" and health <= 0) then
             print(("[Potassium] %s is dead/HP is 0. Moving on."):format(location.Name))
-            return true
+            return true, false
         end
 
         if os.clock() - deathStarted > TARGET_DEATH_TIMEOUT then
             warn(("[Potassium] Timed out waiting for %s HP. Moving on."):format(location.Name))
-            return false
+            return false, false
         end
 
         hideAll()
         task.wait(0.1)
     end
 
-    return false
+    return false, false
 end
 
 local arenaRoots = {
@@ -2662,8 +2722,12 @@ end
 
 local function pressExactSelectedGamemodeYes()
     local option = getExactSelectedGamemodeOption()
-    if option then
-        return pressExactGamemodeNotifyYes(option)
+    if option and pressExactGamemodeNotifyYes(option) then
+        if requiresPriorityJoinConfirmation(option) then
+            return confirmPriorityGamemodeJoin(option)
+        end
+
+        return true
     end
 
     return false
@@ -2692,10 +2756,6 @@ local function runExactGamemodePromptWatcher(Library)
 end
 
 local function pressVisibleGamemodeYes(Library)
-    if getGamemodeSelection("Dungeon", "World9Dungeon") and pressVisibleFireCityYes() then
-        return true
-    end
-
     if pressExactSelectedGamemodeYes() then
         return true
     end
@@ -2716,15 +2776,6 @@ local function pressVisibleGamemodeYes(Library)
             and option
             and not isGamemodePromptSuppressed(option, cardInfo.Card)
             and not (cardInfo.Kind == "Raid" and cardInfo.Payload.Key == "World5" and not isGateRankSelected(cardInfo.Payload.GateRank or cardInfo.Payload.Rank)) then
-            if cardInfo.Kind == "Dungeon"
-                and (cardInfo.Payload.Key == "World9Dungeon" or tostring(cardInfo.Description):lower():find("fire city", 1, true)) then
-                if pressVisibleFireCityYes() then
-                    return true
-                end
-
-                return joinFireCityDungeon(Library)
-            end
-
             if fireGuiButton(cardInfo.Button) then
                 recordJoinedPrompt(option, cardInfo.Card)
                 state.LastGamemodeJoinAt = os.clock()
@@ -2732,6 +2783,10 @@ local function pressVisibleGamemodeYes(Library)
 
                 if isGateOption(option) then
                     return enterActiveGate(option)
+                end
+
+                if requiresPriorityJoinConfirmation(option) then
+                    return confirmPriorityGamemodeJoin(option)
                 end
 
                 return true
@@ -3116,6 +3171,61 @@ local function runLocationRoute()
         return
     end
 
+    local function runSelectedLocation(location)
+        local canResume, interrupted = waitForWorldRouteResume()
+        if not canResume then
+            return false
+        elseif interrupted then
+            return true
+        end
+
+        local currentWorld
+        pcall(function()
+            currentWorld = WorldController:GetCurrentWorld()
+        end)
+
+        if currentWorld ~= location.World then
+            print(("[Potassium] Switching to world %d for %s."):format(location.World, location.Name))
+            requestChangeWorld:Fire(location.World)
+
+            local started = os.clock()
+            repeat
+                if shouldPauseWorldRouteForAutoJoin() then
+                    waitForWorldRouteResume()
+                    return true
+                end
+
+                hideAll()
+                task.wait(0.15)
+                pcall(function()
+                    currentWorld = WorldController:GetCurrentWorld()
+                end)
+            until currentWorld == location.World
+                or os.clock() - started > WORLD_CHANGE_TIMEOUT
+                or not state.Enabled
+                or not state.RouteRunning
+
+            task.wait(0.35)
+
+            if currentWorld ~= location.World then
+                warn(("[Potassium] World %d did not load for %s; skipping its coordinates."):format(location.World, location.Name))
+                return false
+            end
+        end
+
+        canResume, interrupted = waitForWorldRouteResume()
+        if not canResume then
+            return false
+        elseif interrupted then
+            return true
+        end
+
+        print(("[Potassium] Teleporting to %s."):format(location.Name))
+        moveCharacterTo(location.Position)
+        local _, targetInterrupted = waitForTargetDeath(location)
+        return targetInterrupted == true
+    end
+
     while state.Enabled and state.RouteRunning do
         local ranAny = false
 
@@ -3129,41 +3239,13 @@ local function runLocationRoute()
             end
 
             ranAny = true
-
-            local currentWorld
-            pcall(function()
-                currentWorld = WorldController:GetCurrentWorld()
-            end)
-
-            if currentWorld ~= location.World then
-                print(("[Potassium] Switching to world %d for %s."):format(location.World, location.Name))
-                requestChangeWorld:Fire(location.World)
-
-                local started = os.clock()
-                repeat
-                    hideAll()
-                    task.wait(0.15)
-
-                    pcall(function()
-                        currentWorld = WorldController:GetCurrentWorld()
-                    end)
-                until currentWorld == location.World or os.clock() - started > WORLD_CHANGE_TIMEOUT or not state.Enabled or not state.RouteRunning
-
-                task.wait(0.35)
-
-                if currentWorld ~= location.World then
-                    warn(("[Potassium] World %d did not load for %s; skipping its coordinates."):format(location.World, location.Name))
-                    continue
-                end
-            end
-
-            if not state.Enabled or not state.RouteRunning then
-                break
-            end
-
-            print(("[Potassium] Teleporting to %s."):format(location.Name))
-            moveCharacterTo(location.Position)
-            waitForTargetDeath(location)
+            local interrupted
+            repeat
+                interrupted = runSelectedLocation(location)
+            until not interrupted
+                or not state.Enabled
+                or not state.RouteRunning
+                or state.SelectedLocations[location.Name] == false
         end
 
         if not ranAny then
@@ -3173,6 +3255,7 @@ local function runLocationRoute()
     end
 
     state.RouteRunning = false
+    state.RoutePausedForAutoJoin = false
     print("[Potassium] Location route stopped.")
 end
 
@@ -3273,6 +3356,7 @@ local function buildRouteGui()
     local activeModeFilter = state.ModeFilter
     local filterClicksEnabledAt = os.clock() + 0.4
     local rowActionAt = 0
+    local startButton
     local dungeonButton
     local modeList
 
@@ -3328,12 +3412,19 @@ local function buildRouteGui()
             end
         end
 
+        local routeStatus = state.RoutePausedForAutoJoin and "PAUSED"
+            or (state.RouteRunning and "RUNNING" or "READY")
         status.Text = ("Route %s | Raid %s | %d/%d"):format(
-            state.RouteRunning and "RUNNING" or "READY",
+            routeStatus,
             state.AutoDungeonRaidWanted and "ON" or "OFF",
             selected,
             #locations
         )
+
+        if startButton then
+            startButton.Text = state.RouteRunning and "Stop Route" or "Start Route"
+            startButton.BackgroundColor3 = state.RouteRunning and Color3.fromRGB(130, 68, 58) or Color3.fromRGB(54, 82, 125)
+        end
 
         if dungeonButton then
             dungeonButton.Text = state.AutoDungeonRaidWanted and "Stop Dungeon/Raid" or "Auto Dungeon/Raid"
@@ -3640,7 +3731,7 @@ local function buildRouteGui()
         makeArenaRow(option)
     end
 
-    local startButton = Instance.new("TextButton")
+    startButton = Instance.new("TextButton")
     startButton.Name = "StartStop"
     startButton.Size = UDim2.new(1, 0, 0, 32)
     startButton.Position = UDim2.fromOffset(0, 468)
@@ -3763,11 +3854,17 @@ local function buildRouteGui()
 
     refreshArenaRows()
     updateStatus()
+    task.spawn(function()
+        while state.Enabled and gui.Parent do
+            updateStatus()
+            task.wait(0.25)
+        end
+    end)
 end
 
 buildRouteGui()
 
-if AUTO_START_ROUTE then
+if AUTO_START_ROUTE or restartRouteAfterReload then
     task.spawn(runLocationRoute)
 end
 
