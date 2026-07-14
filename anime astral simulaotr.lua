@@ -27,6 +27,8 @@ local RAID_GATE_POLL_INTERVAL = 5
 local AVAILABILITY_WAIT_LOG_INTERVAL = 10
 local RAID_CREATE_JOIN_DELAY = 1
 local PRIORITY_JOIN_AFTER_TITAN_LEAVE_DELAY = 2
+local PRIORITY_JOIN_CONFIRM_TIMEOUT = 8
+local PRIORITY_JOIN_RETRY_INTERVAL = 1
 local AUTO_START_ROUTE = false
 local GUI_FULL_HEIGHT = 600
 
@@ -2545,6 +2547,52 @@ local function getExactSelectedGamemodeOption(maxPriorityExclusive)
     return nil
 end
 
+local function requiresPriorityJoinConfirmation(option)
+    return option
+        and (
+            (option.Kind == "Dungeon" and option.Key == "World9Dungeon")
+            or (
+                option.Kind == "TimeTrial"
+                and (option.Key == "Easy" or option.Key == "Medium")
+            )
+        )
+end
+
+local function confirmPriorityGamemodeJoin(option)
+    local started = os.clock()
+    local lastRetryAt = started
+
+    while state.Enabled
+        and state.AutoDungeonRaidWanted
+        and os.clock() - started < PRIORITY_JOIN_CONFIRM_TIMEOUT do
+        local contextKind, contextKey = getCombatVisibilityContext()
+        if contextKind == option.Kind and contextKey == option.Key then
+            print(("[Potassium] Confirmed priority join: %s:%s."):format(option.Kind, option.Key))
+            return true
+        end
+
+        local now = os.clock()
+        if now - lastRetryAt >= PRIORITY_JOIN_RETRY_INTERVAL then
+            lastRetryAt = now
+            local retryButton, cardName, card = getExactGamemodeNotifyButton(option)
+            if retryButton and fireGuiButton(retryButton) then
+                recordJoinedPrompt(option, card)
+                state.LastGamemodeJoinAt = now
+                print(("[Potassium] Re-pressed %s.Actions.YES while awaiting destination context."):format(tostring(cardName)))
+            end
+        end
+
+        task.wait(0.1)
+    end
+
+    warn(("[Potassium] %s:%s did not become active within %ds after YES."):format(
+        option.Kind,
+        option.Key,
+        PRIORITY_JOIN_CONFIRM_TIMEOUT
+    ))
+    return false
+end
+
 local function handleExactGamemodePrompt(Library, option)
     if not option then
         return false
@@ -2599,6 +2647,10 @@ local function handleExactGamemodePrompt(Library, option)
 
             if isGateOption(option) then
                 return enterActiveGate(option)
+            end
+
+            if requiresPriorityJoinConfirmation(option) then
+                return confirmPriorityGamemodeJoin(option)
             end
 
             return true
