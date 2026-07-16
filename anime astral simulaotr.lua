@@ -1,9 +1,31 @@
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local UserInputService = game:GetService("UserInputService")
+local HttpService = game:GetService("HttpService")
 
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
+local SETTINGS_FOLDER = "Potassium"
+local SETTINGS_FILE = SETTINGS_FOLDER .. "/hide_loading_screens_" .. tostring(player.UserId) .. ".json"
+
+local function loadSavedSettings()
+    if typeof(isfile) ~= "function" or typeof(readfile) ~= "function" or not isfile(SETTINGS_FILE) then
+        return {}
+    end
+
+    local ok, decoded = pcall(function()
+        return HttpService:JSONDecode(readfile(SETTINGS_FILE))
+    end)
+
+    if ok and type(decoded) == "table" then
+        return decoded
+    end
+
+    warn("[Potassium] Saved settings could not be decoded; using defaults.")
+    return {}
+end
+
+local savedSettings = loadSavedSettings()
 
 local WAIT_AT_LOCATION = 0.1
 local WORLD_CHANGE_TIMEOUT = 12
@@ -28,6 +50,7 @@ local RAID_CREATE_JOIN_DELAY = 1
 local PRIORITY_JOIN_AFTER_TITAN_LEAVE_DELAY = 2
 local PRIORITY_JOIN_CONFIRM_TIMEOUT = 8
 local PRIORITY_JOIN_RETRY_INTERVAL = 1
+local AUTO_EXCHANGE_INTERVAL = 0.3
 local AUTO_START_ROUTE = false
 local GUI_FULL_HEIGHT = 600
 
@@ -164,8 +187,12 @@ local gamemodeOptions = {
 }
 
 local old = getgenv and getgenv().PotassiumHideLoading
-local restartDungeonFarmAfterReload = type(old) == "table" and (old.AutoDungeonRaidWanted == true or old.DungeonFarmRunning == true)
-local restartRouteAfterReload = type(old) == "table" and old.RouteRunning == true
+local restartDungeonFarmAfterReload = type(old) == "table"
+    and (old.AutoDungeonRaidWanted == true or old.DungeonFarmRunning == true)
+    or (type(old) ~= "table" and savedSettings.AutoDungeonRaidWanted == true)
+local restartRouteAfterReload = type(old) == "table"
+    and old.RouteRunning == true
+    or (type(old) ~= "table" and savedSettings.RouteRunning == true)
 if old and old.Disconnect then
     pcall(function()
         old:Disconnect()
@@ -179,6 +206,23 @@ local state = {
     RoutePausedForAutoJoin = false,
     DungeonFarmRunning = false,
     AutoDungeonRaidWanted = false,
+    AutoExchangeLoopRunning = false,
+    ExchangeRecipeCursor = 1,
+    TokenRecipeCursor = 1,
+    SelectedExchangeRecipes = {},
+    SelectedTokenRecipes = {},
+    ExchangeCategoryFilter = "Exchange",
+    RouteGuiPosition = {
+        X = 90,
+        Y = 210,
+    },
+    RouteGuiMinimized = false,
+    ExchangeGuiPosition = {
+        X = 400,
+        Y = 210,
+    },
+    ExchangeGuiMinimized = false,
+    LastExchangeWarningAt = 0,
     LastDungeonToggleAt = 0,
     LastGamemodeJoinAt = 0,
     LastFireCityGuiScanAt = 0,
@@ -222,6 +266,71 @@ local state = {
     ModeFilter = "All",
 }
 
+local function copyBooleanSettings(target, source)
+    if type(source) ~= "table" then
+        return
+    end
+
+    for key, enabled in pairs(source) do
+        if type(key) == "string" and type(enabled) == "boolean" then
+            target[key] = enabled
+        end
+    end
+end
+
+local function copyNumberSettings(target, source)
+    if type(source) ~= "table" then
+        return
+    end
+
+    for key, value in pairs(source) do
+        if type(key) == "string" and type(value) == "number" then
+            target[key] = value
+        end
+    end
+end
+
+local function applySavedGuiState(source)
+    if type(source) ~= "table" then
+        return
+    end
+
+    if type(source.RouteGuiPosition) == "table" then
+        state.RouteGuiPosition.X = tonumber(source.RouteGuiPosition.X) or state.RouteGuiPosition.X
+        state.RouteGuiPosition.Y = tonumber(source.RouteGuiPosition.Y) or state.RouteGuiPosition.Y
+    end
+
+    if type(source.ExchangeGuiPosition) == "table" then
+        state.ExchangeGuiPosition.X = tonumber(source.ExchangeGuiPosition.X) or state.ExchangeGuiPosition.X
+        state.ExchangeGuiPosition.Y = tonumber(source.ExchangeGuiPosition.Y) or state.ExchangeGuiPosition.Y
+    end
+
+    if type(source.RouteGuiMinimized) == "boolean" then
+        state.RouteGuiMinimized = source.RouteGuiMinimized
+    end
+
+    if type(source.ExchangeGuiMinimized) == "boolean" then
+        state.ExchangeGuiMinimized = source.ExchangeGuiMinimized
+    end
+end
+
+if type(savedSettings) == "table" then
+    copyBooleanSettings(state.SelectedLocations, savedSettings.SelectedLocations)
+    copyBooleanSettings(state.SelectedArenaTypes, savedSettings.SelectedArenaTypes)
+    copyBooleanSettings(state.SelectedExchangeRecipes, savedSettings.SelectedExchangeRecipes)
+    copyBooleanSettings(state.SelectedTokenRecipes, savedSettings.SelectedTokenRecipes)
+
+    if type(savedSettings.ModeFilter) == "string" then
+        state.ModeFilter = savedSettings.ModeFilter
+    end
+
+    if savedSettings.ExchangeCategoryFilter == "Token" then
+        state.ExchangeCategoryFilter = "Token"
+    end
+
+    applySavedGuiState(savedSettings)
+end
+
 if type(old) == "table" then
     state.AutoDungeonRaidWanted = restartDungeonFarmAfterReload
 
@@ -251,6 +360,24 @@ if type(old) == "table" then
     if type(old.ModeFilter) == "string" then
         state.ModeFilter = old.ModeFilter
     end
+
+    if type(old.SelectedExchangeRecipes) == "table" then
+        for recipeId, enabled in pairs(old.SelectedExchangeRecipes) do
+            state.SelectedExchangeRecipes[recipeId] = enabled == true
+        end
+    end
+
+    if type(old.SelectedTokenRecipes) == "table" then
+        for recipeId, enabled in pairs(old.SelectedTokenRecipes) do
+            state.SelectedTokenRecipes[recipeId] = enabled == true
+        end
+    end
+
+    if old.ExchangeCategoryFilter == "Token" then
+        state.ExchangeCategoryFilter = "Token"
+    end
+
+    applySavedGuiState(old)
 end
 
 local addingGateRankA = type(old) == "table"
@@ -264,6 +391,8 @@ for index, option in ipairs(gamemodeOptions) do
     local oldOptionSelected
     if type(old) == "table" and type(old.SelectedGamemodeIds) == "table" then
         oldOptionSelected = old.SelectedGamemodeIds[optionId]
+    elseif type(savedSettings.SelectedGamemodeIds) == "table" then
+        oldOptionSelected = savedSettings.SelectedGamemodeIds[optionId]
     end
 
     if oldOptionSelected ~= nil then
@@ -280,6 +409,8 @@ for index, option in ipairs(gamemodeOptions) do
         if addingGateRankA and oldPriority and oldPriority >= 8 then
             oldPriority += 1
         end
+    elseif type(savedSettings.GamemodePriority) == "table" then
+        oldPriority = tonumber(savedSettings.GamemodePriority[optionId])
     end
 
     state.GamemodePriority[optionId] = oldPriority or index
@@ -295,19 +426,93 @@ if getgenv then
     getgenv().PotassiumHideLoading = state
 end
 
+local settingsSavePending = false
+
+local function cloneBooleanSettings(source)
+    local result = {}
+    copyBooleanSettings(result, source)
+    return result
+end
+
+local function cloneNumberSettings(source)
+    local result = {}
+    copyNumberSettings(result, source)
+    return result
+end
+
+local function getSettingsSnapshot()
+    return {
+        Version = 1,
+        RouteRunning = state.RouteRunning == true,
+        AutoDungeonRaidWanted = state.AutoDungeonRaidWanted == true,
+        SelectedLocations = cloneBooleanSettings(state.SelectedLocations),
+        SelectedArenaTypes = cloneBooleanSettings(state.SelectedArenaTypes),
+        SelectedGamemodeIds = cloneBooleanSettings(state.SelectedGamemodeIds),
+        GamemodePriority = cloneNumberSettings(state.GamemodePriority),
+        ModeFilter = state.ModeFilter,
+        SelectedExchangeRecipes = cloneBooleanSettings(state.SelectedExchangeRecipes),
+        SelectedTokenRecipes = cloneBooleanSettings(state.SelectedTokenRecipes),
+        ExchangeCategoryFilter = state.ExchangeCategoryFilter,
+        RouteGuiPosition = {
+            X = state.RouteGuiPosition.X,
+            Y = state.RouteGuiPosition.Y,
+        },
+        RouteGuiMinimized = state.RouteGuiMinimized == true,
+        ExchangeGuiPosition = {
+            X = state.ExchangeGuiPosition.X,
+            Y = state.ExchangeGuiPosition.Y,
+        },
+        ExchangeGuiMinimized = state.ExchangeGuiMinimized == true,
+    }
+end
+
+local function saveSettingsNow()
+    if typeof(writefile) ~= "function" then
+        return false
+    end
+
+    local ok, errorMessage = pcall(function()
+        if typeof(isfolder) == "function" and typeof(makefolder) == "function" and not isfolder(SETTINGS_FOLDER) then
+            makefolder(SETTINGS_FOLDER)
+        end
+
+        writefile(SETTINGS_FILE, HttpService:JSONEncode(getSettingsSnapshot()))
+    end)
+
+    if not ok then
+        warn(("[Potassium] Could not save settings: %s"):format(tostring(errorMessage)))
+    end
+
+    return ok
+end
+
+local function queueSettingsSave()
+    if settingsSavePending then
+        return
+    end
+
+    settingsSavePending = true
+    task.delay(0.2, function()
+        settingsSavePending = false
+        saveSettingsNow()
+    end)
+end
+
 local function addConnection(connection)
     table.insert(state.Connections, connection)
     return connection
 end
 
 function state:Disconnect()
+    saveSettingsNow()
     self.Enabled = false
     self.RouteRunning = false
     self.DungeonFarmRunning = false
     self.AutoDungeonRaidWanted = false
+    self.AutoExchangeLoopRunning = false
     self.GamemodeActionBusy = false
     for _, child in ipairs(playerGui:GetChildren()) do
-        if child.Name == "PotassiumRouteGui" then
+        if child.Name == "PotassiumRouteGui" or child.Name == "PotassiumExchangeGui" then
             pcall(function()
                 child:Destroy()
             end)
@@ -994,6 +1199,7 @@ end
 local function setGamemodeOptionSelection(option, enabled)
     state.SelectedGamemodeIds[getGamemodeOptionId(option)] = enabled == true
     setGamemodeSelection(option.Kind, option.Key, enabled)
+    queueSettingsSave()
 end
 
 local function isGamemodeOptionSelected(option)
@@ -1270,6 +1476,7 @@ local function swapGamemodePriority(leftOption, rightOption)
 
     state.GamemodePriority[leftId] = rightPriority
     state.GamemodePriority[rightId] = leftPriority
+    queueSettingsSave()
 end
 
 local function getGamemodeLabel(kind, key)
@@ -3217,6 +3424,535 @@ local function runLocationRoute()
     print("[Potassium] Location route stopped.")
 end
 
+local exchangeRuntime
+
+local function warnAutoExchange(message)
+    if os.clock() - (state.LastExchangeWarningAt or 0) < 5 then
+        return
+    end
+
+    state.LastExchangeWarningAt = os.clock()
+    warn(("[Potassium] Auto exchange: %s"):format(tostring(message)))
+end
+
+local function getExchangeRuntime()
+    if exchangeRuntime
+        and exchangeRuntime.Config
+        and exchangeRuntime.Request
+        and exchangeRuntime.GetData
+        and exchangeRuntime.GetData.Parent then
+        return exchangeRuntime
+    end
+
+    local ok, Library = pcall(function()
+        return require(ReplicatedStorage:WaitForChild("SimpleWorld"):WaitForChild("Library"))
+    end)
+
+    if not ok or not Library then
+        return nil, "SimpleWorld Library was not available"
+    end
+
+    local config = Library.getConfig("ExchangeConfig")
+    local resources = Library.getConfig("ResourcesConfig")
+    local request = Library.getBridge("ExchangeCraftRequest")
+    local simpleWorld = ReplicatedStorage:FindFirstChild("SimpleWorld")
+    local libraryFolder = simpleWorld and simpleWorld:FindFirstChild("Library")
+    local network = libraryFolder and libraryFolder:FindFirstChild("Network")
+    local functions = network and network:FindFirstChild("Functions")
+    local getData = functions and functions:FindFirstChild("GetExchangeData")
+
+    if not config or not resources or not request or not getData then
+        return nil, "ExchangeConfig, ResourcesConfig, ExchangeCraftRequest, or GetExchangeData was not found"
+    end
+
+    exchangeRuntime = {
+        Config = config,
+        Resources = resources,
+        Request = request,
+        GetData = getData,
+    }
+
+    return exchangeRuntime
+end
+
+local function getRecipeSelection(category)
+    return category == "Exchange" and state.SelectedExchangeRecipes or state.SelectedTokenRecipes
+end
+
+local function hasSelectedExchangeRecipes(selection)
+    for _, enabled in pairs(selection) do
+        if enabled == true then
+            return true
+        end
+    end
+
+    return false
+end
+
+local function countSelectedExchangeRecipes(recipes, selection)
+    local count = 0
+    for _, recipe in ipairs(recipes) do
+        if selection[tostring(recipe.RecipeId or "")] == true then
+            count += 1
+        end
+    end
+
+    return count
+end
+
+local function getNextAffordableExchange(recipes, playerData, cursor, selection)
+    local recipeCount = #recipes
+    if recipeCount == 0 then
+        return
+    end
+
+    local startIndex = math.clamp(math.floor(tonumber(cursor) or 1), 1, recipeCount)
+    for offset = 0, recipeCount - 1 do
+        local index = ((startIndex + offset - 1) % recipeCount) + 1
+        local recipe = recipes[index]
+        local sacrificeItemId = tostring(recipe.SacrificeItemId or "")
+        local sacrificeAmount = math.max(1, math.floor(tonumber(recipe.SacrificeAmount) or 0))
+        local available = math.max(0, math.floor(tonumber(playerData[sacrificeItemId]) or 0))
+        local recipeId = tostring(recipe.RecipeId or "")
+
+        if selection[recipeId] == true and available >= sacrificeAmount then
+            return recipe, index, available, sacrificeAmount
+        end
+    end
+end
+
+local function processExchangeCategory(runtime, category, playerData)
+    local recipes = runtime.Config:GetRecipesSorted(category)
+    local selection = getRecipeSelection(category)
+    local cursorField = category == "Exchange" and "ExchangeRecipeCursor" or "TokenRecipeCursor"
+    local recipe, index, available, sacrificeAmount = getNextAffordableExchange(
+        recipes,
+        playerData,
+        state[cursorField],
+        selection
+    )
+
+    if not recipe then
+        return false
+    end
+
+    local spendAmount
+    local selectedCount = countSelectedExchangeRecipes(recipes, selection)
+    if category == "Exchange" or selectedCount == 1 then
+        spendAmount = math.floor(available / sacrificeAmount) * sacrificeAmount
+    else
+        -- Selected Token recipes share one Exchange Token balance. Rotate one
+        -- craft at a time when several outputs are selected.
+        spendAmount = sacrificeAmount
+    end
+
+    runtime.Request:Fire(tostring(recipe.RecipeId or ""), spendAmount)
+    playerData[tostring(recipe.SacrificeItemId or "")] = math.max(0, available - spendAmount)
+    state[cursorField] = (index % #recipes) + 1
+    return true
+end
+
+local function runAutoExchangeLoop()
+    if state.AutoExchangeLoopRunning then
+        return
+    end
+
+    state.AutoExchangeLoopRunning = true
+
+    while state.Enabled do
+        local exchangeSelected = hasSelectedExchangeRecipes(state.SelectedExchangeRecipes)
+        local tokensSelected = hasSelectedExchangeRecipes(state.SelectedTokenRecipes)
+
+        if exchangeSelected or tokensSelected then
+            local runtime, runtimeError = getExchangeRuntime()
+            if not runtime then
+                warnAutoExchange(runtimeError)
+            else
+                local ok, playerData = pcall(function()
+                    return runtime.GetData:InvokeServer()
+                end)
+
+                if not ok or type(playerData) ~= "table" then
+                    warnAutoExchange("GetExchangeData did not return player data")
+                else
+                    if exchangeSelected then
+                        processExchangeCategory(runtime, "Exchange", playerData)
+                    end
+
+                    if tokensSelected then
+                        processExchangeCategory(runtime, "Token", playerData)
+                    end
+                end
+            end
+        end
+
+        task.wait(AUTO_EXCHANGE_INTERVAL)
+    end
+
+    state.AutoExchangeLoopRunning = false
+end
+
+local function getExchangeResourceName(runtime, itemId)
+    local items = runtime.Resources and runtime.Resources.Items
+    local item = items and items[itemId]
+    return item and tostring(item.Name or itemId) or tostring(itemId)
+end
+
+local function buildExchangeGui()
+    local existing = playerGui:FindFirstChild("PotassiumExchangeGui")
+    if existing then
+        existing:Destroy()
+    end
+
+    local runtime, runtimeError = getExchangeRuntime()
+    if not runtime then
+        warnAutoExchange(runtimeError)
+        return
+    end
+
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "PotassiumExchangeGui"
+    gui.ResetOnSpawn = false
+    gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    gui.DisplayOrder = 101
+    gui.Parent = playerGui
+
+    local frame = Instance.new("Frame")
+    frame.Name = "Main"
+    frame.Size = UDim2.fromOffset(336, 500)
+    frame.Position = UDim2.fromOffset(state.ExchangeGuiPosition.X, state.ExchangeGuiPosition.Y)
+    frame.BackgroundColor3 = Color3.fromRGB(22, 24, 31)
+    frame.BorderSizePixel = 0
+    frame.Active = true
+    frame.Parent = gui
+
+    local frameCorner = Instance.new("UICorner")
+    frameCorner.CornerRadius = UDim.new(0, 8)
+    frameCorner.Parent = frame
+
+    local frameStroke = Instance.new("UIStroke")
+    frameStroke.Color = Color3.fromRGB(139, 104, 42)
+    frameStroke.Thickness = 1
+    frameStroke.Parent = frame
+
+    local title = Instance.new("TextLabel")
+    title.Name = "Title"
+    title.Size = UDim2.new(1, -50, 0, 34)
+    title.Position = UDim2.fromOffset(12, 0)
+    title.BackgroundTransparency = 1
+    title.Font = Enum.Font.GothamBold
+    title.Text = "Auto Exchange"
+    title.TextColor3 = Color3.fromRGB(245, 247, 255)
+    title.TextSize = 15
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.Parent = frame
+
+    local minimize = Instance.new("TextButton")
+    minimize.Name = "Minimize"
+    minimize.Size = UDim2.fromOffset(30, 26)
+    minimize.Position = UDim2.new(1, -36, 0, 4)
+    minimize.BackgroundColor3 = Color3.fromRGB(41, 47, 62)
+    minimize.BorderSizePixel = 0
+    minimize.Font = Enum.Font.GothamBold
+    minimize.Text = "-"
+    minimize.TextColor3 = Color3.fromRGB(245, 247, 255)
+    minimize.TextSize = 18
+    minimize.Parent = frame
+
+    local minimizeCorner = Instance.new("UICorner")
+    minimizeCorner.CornerRadius = UDim.new(0, 6)
+    minimizeCorner.Parent = minimize
+
+    local content = Instance.new("Frame")
+    content.Name = "Content"
+    content.Size = UDim2.new(1, -24, 1, -44)
+    content.Position = UDim2.fromOffset(12, 40)
+    content.BackgroundTransparency = 1
+    content.Parent = frame
+
+    local exchangeTab = Instance.new("TextButton")
+    exchangeTab.Name = "ExchangeTab"
+    exchangeTab.Size = UDim2.fromOffset(153, 28)
+    exchangeTab.Position = UDim2.fromOffset(0, 0)
+    exchangeTab.BackgroundColor3 = Color3.fromRGB(76, 105, 152)
+    exchangeTab.BorderSizePixel = 0
+    exchangeTab.Font = Enum.Font.GothamBold
+    exchangeTab.Text = "EXCHANGE"
+    exchangeTab.TextColor3 = Color3.fromRGB(245, 247, 255)
+    exchangeTab.TextSize = 12
+    exchangeTab.Parent = content
+
+    local exchangeTabCorner = Instance.new("UICorner")
+    exchangeTabCorner.CornerRadius = UDim.new(0, 6)
+    exchangeTabCorner.Parent = exchangeTab
+
+    local tokenTab = Instance.new("TextButton")
+    tokenTab.Name = "TokensTab"
+    tokenTab.Size = UDim2.fromOffset(153, 28)
+    tokenTab.Position = UDim2.fromOffset(159, 0)
+    tokenTab.BackgroundColor3 = Color3.fromRGB(41, 47, 62)
+    tokenTab.BorderSizePixel = 0
+    tokenTab.Font = Enum.Font.GothamBold
+    tokenTab.Text = "TOKENS"
+    tokenTab.TextColor3 = Color3.fromRGB(245, 247, 255)
+    tokenTab.TextSize = 12
+    tokenTab.Parent = content
+
+    local tokenTabCorner = Instance.new("UICorner")
+    tokenTabCorner.CornerRadius = UDim.new(0, 6)
+    tokenTabCorner.Parent = tokenTab
+
+    local status = Instance.new("TextLabel")
+    status.Name = "Status"
+    status.Size = UDim2.new(1, 0, 0, 20)
+    status.Position = UDim2.fromOffset(0, 34)
+    status.BackgroundTransparency = 1
+    status.Font = Enum.Font.Gotham
+    status.TextColor3 = Color3.fromRGB(190, 205, 235)
+    status.TextSize = 12
+    status.TextXAlignment = Enum.TextXAlignment.Left
+    status.Parent = content
+
+    local allButton = Instance.new("TextButton")
+    allButton.Name = "SelectAll"
+    allButton.Size = UDim2.new(1, 0, 0, 28)
+    allButton.Position = UDim2.fromOffset(0, 58)
+    allButton.BackgroundColor3 = Color3.fromRGB(41, 47, 62)
+    allButton.BorderSizePixel = 0
+    allButton.Text = ""
+    allButton.Parent = content
+
+    local allCorner = Instance.new("UICorner")
+    allCorner.CornerRadius = UDim.new(0, 6)
+    allCorner.Parent = allButton
+
+    local allBox = Instance.new("TextLabel")
+    allBox.Name = "Check"
+    allBox.Size = UDim2.fromOffset(32, 20)
+    allBox.Position = UDim2.fromOffset(4, 4)
+    allBox.BackgroundColor3 = Color3.fromRGB(18, 21, 29)
+    allBox.BorderSizePixel = 0
+    allBox.Font = Enum.Font.GothamBold
+    allBox.TextColor3 = Color3.fromRGB(120, 220, 145)
+    allBox.TextSize = 10
+    allBox.Parent = allButton
+
+    local allBoxCorner = Instance.new("UICorner")
+    allBoxCorner.CornerRadius = UDim.new(0, 5)
+    allBoxCorner.Parent = allBox
+
+    local allLabel = Instance.new("TextLabel")
+    allLabel.Name = "Label"
+    allLabel.Size = UDim2.new(1, -46, 1, 0)
+    allLabel.Position = UDim2.fromOffset(44, 0)
+    allLabel.BackgroundTransparency = 1
+    allLabel.Font = Enum.Font.GothamSemibold
+    allLabel.TextColor3 = Color3.fromRGB(245, 247, 255)
+    allLabel.TextSize = 12
+    allLabel.TextXAlignment = Enum.TextXAlignment.Left
+    allLabel.Parent = allButton
+
+    local list = Instance.new("ScrollingFrame")
+    list.Name = "RecipeList"
+    list.Size = UDim2.new(1, 0, 0, 360)
+    list.Position = UDim2.fromOffset(0, 92)
+    list.BackgroundTransparency = 1
+    list.BorderSizePixel = 0
+    list.ScrollBarThickness = 5
+    list.CanvasSize = UDim2.fromOffset(0, 0)
+    list.Parent = content
+
+    local rows = {
+        Exchange = {},
+        Token = {},
+    }
+
+    local function makeRecipeRow(category, recipe)
+        local recipeId = tostring(recipe.RecipeId or "")
+        local selection = getRecipeSelection(category)
+        local button = Instance.new("TextButton")
+        button.Name = recipeId:gsub("%W+", "") .. "Toggle"
+        button.Size = UDim2.new(1, -7, 0, 26)
+        button.BackgroundColor3 = Color3.fromRGB(41, 47, 62)
+        button.BorderSizePixel = 0
+        button.Text = ""
+        button.Visible = false
+        button.Parent = list
+
+        local buttonCorner = Instance.new("UICorner")
+        buttonCorner.CornerRadius = UDim.new(0, 6)
+        buttonCorner.Parent = button
+
+        local box = Instance.new("TextLabel")
+        box.Name = "Check"
+        box.Size = UDim2.fromOffset(28, 20)
+        box.Position = UDim2.fromOffset(4, 3)
+        box.BackgroundColor3 = Color3.fromRGB(18, 21, 29)
+        box.BorderSizePixel = 0
+        box.Font = Enum.Font.GothamBold
+        box.TextColor3 = Color3.fromRGB(120, 220, 145)
+        box.TextSize = 10
+        box.Parent = button
+
+        local boxCorner = Instance.new("UICorner")
+        boxCorner.CornerRadius = UDim.new(0, 5)
+        boxCorner.Parent = box
+
+        local label = Instance.new("TextLabel")
+        label.Name = "Label"
+        label.Size = UDim2.new(1, -42, 1, 0)
+        label.Position = UDim2.fromOffset(38, 0)
+        label.BackgroundTransparency = 1
+        label.Font = Enum.Font.GothamSemibold
+        label.Text = ("%s -> %s"):format(
+            getExchangeResourceName(runtime, tostring(recipe.SacrificeItemId or "")),
+            getExchangeResourceName(runtime, tostring(recipe.RewardItemId or ""))
+        )
+        label.TextColor3 = Color3.fromRGB(245, 247, 255)
+        label.TextSize = 11
+        label.TextXAlignment = Enum.TextXAlignment.Left
+        label.Parent = button
+
+        button.MouseButton1Click:Connect(function()
+            selection[recipeId] = not (selection[recipeId] == true)
+            rows.Refresh()
+            queueSettingsSave()
+        end)
+
+        rows[category][recipeId] = {
+            Button = button,
+            Box = box,
+            Recipe = recipe,
+        }
+    end
+
+    for _, category in ipairs({ "Exchange", "Token" }) do
+        for _, recipe in ipairs(runtime.Config:GetRecipesSorted(category)) do
+            makeRecipeRow(category, recipe)
+        end
+    end
+
+    function rows.Refresh()
+        local category = state.ExchangeCategoryFilter == "Token" and "Token" or "Exchange"
+        local selection = getRecipeSelection(category)
+        local recipes = runtime.Config:GetRecipesSorted(category)
+        local selectedCount = countSelectedExchangeRecipes(recipes, selection)
+        local y = 0
+
+        for rowCategory, categoryRows in pairs(rows) do
+            if type(categoryRows) == "table" then
+                for _, row in pairs(categoryRows) do
+                    row.Button.Visible = false
+                end
+            end
+        end
+
+        for _, recipe in ipairs(recipes) do
+            local recipeId = tostring(recipe.RecipeId or "")
+            local row = rows[category][recipeId]
+            local selected = selection[recipeId] == true
+            if row then
+                row.Button.Visible = true
+                row.Button.Position = UDim2.fromOffset(0, y)
+                row.Button.BackgroundColor3 = selected and Color3.fromRGB(38, 88, 61) or Color3.fromRGB(41, 47, 62)
+                row.Box.Text = selected and "ON" or ""
+                y += 30
+            end
+        end
+
+        list.CanvasSize = UDim2.fromOffset(0, y)
+        status.Text = ("%d/%d selected | %.1fs"):format(selectedCount, #recipes, AUTO_EXCHANGE_INTERVAL)
+        allBox.Text = selectedCount == #recipes and "ON" or (selectedCount > 0 and "-" or "")
+        allLabel.Text = category == "Exchange" and "All Exchange recipes" or "All Token recipes"
+        allButton.BackgroundColor3 = selectedCount > 0 and Color3.fromRGB(38, 58, 88) or Color3.fromRGB(41, 47, 62)
+        exchangeTab.BackgroundColor3 = category == "Exchange" and Color3.fromRGB(76, 105, 152) or Color3.fromRGB(41, 47, 62)
+        tokenTab.BackgroundColor3 = category == "Token" and Color3.fromRGB(76, 105, 152) or Color3.fromRGB(41, 47, 62)
+    end
+
+    exchangeTab.MouseButton1Click:Connect(function()
+        state.ExchangeCategoryFilter = "Exchange"
+        list.CanvasPosition = Vector2.zero
+        rows.Refresh()
+        queueSettingsSave()
+    end)
+
+    tokenTab.MouseButton1Click:Connect(function()
+        state.ExchangeCategoryFilter = "Token"
+        list.CanvasPosition = Vector2.zero
+        rows.Refresh()
+        queueSettingsSave()
+    end)
+
+    allButton.MouseButton1Click:Connect(function()
+        local category = state.ExchangeCategoryFilter == "Token" and "Token" or "Exchange"
+        local selection = getRecipeSelection(category)
+        local recipes = runtime.Config:GetRecipesSorted(category)
+        local enable = countSelectedExchangeRecipes(recipes, selection) < #recipes
+
+        for _, recipe in ipairs(recipes) do
+            selection[tostring(recipe.RecipeId or "")] = enable
+        end
+
+        rows.Refresh()
+        queueSettingsSave()
+    end)
+
+    local minimized = state.ExchangeGuiMinimized == true
+    content.Visible = not minimized
+    frame.Size = minimized and UDim2.fromOffset(336, 34) or UDim2.fromOffset(336, 500)
+    minimize.Text = minimized and "+" or "-"
+
+    minimize.MouseButton1Click:Connect(function()
+        minimized = not minimized
+        state.ExchangeGuiMinimized = minimized
+        content.Visible = not minimized
+        frame.Size = minimized and UDim2.fromOffset(336, 34) or UDim2.fromOffset(336, 500)
+        minimize.Text = minimized and "+" or "-"
+        queueSettingsSave()
+    end)
+
+    local dragging = false
+    local dragStart
+    local frameStart
+
+    frame.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            frameStart = frame.Position
+
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                    state.ExchangeGuiPosition.X = frame.Position.X.Offset
+                    state.ExchangeGuiPosition.Y = frame.Position.Y.Offset
+                    queueSettingsSave()
+                end
+            end)
+        end
+    end)
+
+    addConnection(UserInputService.InputChanged:Connect(function(input)
+        if not dragging then
+            return
+        end
+
+        if input.UserInputType ~= Enum.UserInputType.MouseMovement and input.UserInputType ~= Enum.UserInputType.Touch then
+            return
+        end
+
+        local delta = input.Position - dragStart
+        frame.Position = UDim2.new(
+            frameStart.X.Scale,
+            frameStart.X.Offset + delta.X,
+            frameStart.Y.Scale,
+            frameStart.Y.Offset + delta.Y
+        )
+    end))
+
+    rows.Refresh()
+end
+
 local function buildRouteGui()
     for _, child in ipairs(playerGui:GetChildren()) do
         if child.Name == "PotassiumRouteGui" then
@@ -3239,7 +3975,7 @@ local function buildRouteGui()
     local frame = Instance.new("Frame")
     frame.Name = "Main"
     frame.Size = UDim2.fromOffset(292, GUI_FULL_HEIGHT)
-    frame.Position = UDim2.fromOffset(90, 210)
+    frame.Position = UDim2.fromOffset(state.RouteGuiPosition.X, state.RouteGuiPosition.Y)
     frame.BackgroundColor3 = Color3.fromRGB(22, 24, 31)
     frame.BorderSizePixel = 0
     frame.Active = true
@@ -3440,6 +4176,7 @@ local function buildRouteGui()
         button.MouseButton1Click:Connect(function()
             state.SelectedLocations[location.Name] = not (state.SelectedLocations[location.Name] ~= false)
             updateStatus()
+            queueSettingsSave()
         end)
 
         rows[location.Name] = {
@@ -3526,6 +4263,7 @@ local function buildRouteGui()
             activeModeFilter = name
             state.ModeFilter = name
             refreshArenaRows()
+            queueSettingsSave()
         end)
 
         filterButtons[name] = button
@@ -3726,6 +4464,7 @@ local function buildRouteGui()
             state.RouteRunning = false
             startButton.Text = "Start Route"
             updateStatus()
+            queueSettingsSave()
             return
         end
 
@@ -3736,6 +4475,7 @@ local function buildRouteGui()
             updateStatus()
         end)
         updateStatus()
+        queueSettingsSave()
     end)
 
     dungeonButton.MouseButton1Click:Connect(function()
@@ -3749,6 +4489,7 @@ local function buildRouteGui()
             state.AutoDungeonRaidWanted = false
             state.DungeonFarmRunning = false
             updateStatus()
+            queueSettingsSave()
             return
         end
 
@@ -3758,14 +4499,21 @@ local function buildRouteGui()
             updateStatus()
         end)
         updateStatus()
+        queueSettingsSave()
     end)
 
-    local minimized = false
+    local minimized = state.RouteGuiMinimized == true
+    content.Visible = not minimized
+    frame.Size = minimized and UDim2.fromOffset(292, 34) or UDim2.fromOffset(292, GUI_FULL_HEIGHT)
+    minimize.Text = minimized and "+" or "-"
+
     minimize.MouseButton1Click:Connect(function()
         minimized = not minimized
+        state.RouteGuiMinimized = minimized
         content.Visible = not minimized
         frame.Size = minimized and UDim2.fromOffset(292, 34) or UDim2.fromOffset(292, GUI_FULL_HEIGHT)
         minimize.Text = minimized and "+" or "-"
+        queueSettingsSave()
     end)
 
     local dragging = false
@@ -3781,6 +4529,9 @@ local function buildRouteGui()
             input.Changed:Connect(function()
                 if input.UserInputState == Enum.UserInputState.End then
                     dragging = false
+                    state.RouteGuiPosition.X = frame.Position.X.Offset
+                    state.RouteGuiPosition.Y = frame.Position.Y.Offset
+                    queueSettingsSave()
                 end
             end)
         end
@@ -3821,6 +4572,8 @@ local function buildRouteGui()
 end
 
 buildRouteGui()
+buildExchangeGui()
+task.spawn(runAutoExchangeLoop)
 
 if AUTO_START_ROUTE or restartRouteAfterReload then
     task.spawn(runLocationRoute)
@@ -3830,4 +4583,5 @@ if restartDungeonFarmAfterReload then
     task.spawn(runDungeonRaidFarm)
 end
 
+task.delay(0.5, saveSettingsNow)
 print("[Potassium] Loading hider and route GUI enabled.")
