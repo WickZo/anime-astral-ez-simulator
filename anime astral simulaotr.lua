@@ -21,8 +21,7 @@ local GAMEMODE_GUI_SCAN_INTERVAL = 0.5
 local GAMEMODE_OPEN_WINDOW = 60
 local GAMEMODE_JOIN_COOLDOWN = 4
 local PROMPT_SUPPRESSION_INACTIVE_GRACE = 5
-local GATE_ENTRY_TIMEOUT = 20
-local GATE_TOUCH_INTERVAL = 0.12
+local GATE_JOIN_CONFIRM_TIMEOUT = 10
 local RAID_GATE_POLL_INTERVAL = 5
 local AVAILABILITY_WAIT_LOG_INTERVAL = 10
 local RAID_CREATE_JOIN_DELAY = 1
@@ -125,6 +124,12 @@ local gamemodeOptions = {
         Key = "World5",
         GateRank = "B",
         Name = "Gate Rank B",
+    },
+    {
+        Kind = "Raid",
+        Key = "World5",
+        GateRank = "A",
+        Name = "Gate Rank A",
     },
     {
         Kind = "Raid",
@@ -248,6 +253,10 @@ if type(old) == "table" then
     end
 end
 
+local addingGateRankA = type(old) == "table"
+    and type(old.GamemodePriority) == "table"
+    and old.GamemodePriority["Raid:World5:A"] == nil
+
 for index, option in ipairs(gamemodeOptions) do
     local optionId = option.Kind .. ":" .. option.Key .. (option.GateRank and (":" .. option.GateRank) or "")
     state.SelectedGamemodes[option.Kind] = state.SelectedGamemodes[option.Kind] or {}
@@ -268,6 +277,9 @@ for index, option in ipairs(gamemodeOptions) do
     local oldPriority
     if type(old) == "table" and type(old.GamemodePriority) == "table" then
         oldPriority = tonumber(old.GamemodePriority[optionId])
+        if addingGateRankA and oldPriority and oldPriority >= 8 then
+            oldPriority += 1
+        end
     end
 
     state.GamemodePriority[optionId] = oldPriority or index
@@ -941,14 +953,22 @@ local function getArenaDistanceFromCharacter(enemies)
     return bestDistance
 end
 
+local function isWorldFiveGateKey(key)
+    if type(key) ~= "string" then
+        return false
+    end
+
+    return key == "World5" or key:match("^World5_") ~= nil
+end
+
 local function getGamemodeSelection(kind, key)
     if state.SelectedArenaTypes[kind] == false then
         return false
     end
 
-    if kind == "Raid" and key == "World5" then
+    if kind == "Raid" and isWorldFiveGateKey(key) then
         for _, option in ipairs(gamemodeOptions) do
-            if option.Kind == kind and option.Key == key then
+            if option.Kind == kind and option.Key == "World5" then
                 local optionId = option.Kind .. ":" .. option.Key .. ":" .. option.GateRank
                 if state.SelectedGamemodeIds[optionId] ~= false then
                     return true
@@ -980,16 +1000,6 @@ local function isGamemodeOptionSelected(option)
     return state.SelectedGamemodeIds[getGamemodeOptionId(option)] ~= false
 end
 
-local function getSelectedGateRank()
-    for _, option in ipairs(gamemodeOptions) do
-        if option.Kind == "Raid" and option.Key == "World5" and option.GateRank and isGamemodeOptionSelected(option) then
-            return option.GateRank
-        end
-    end
-
-    return nil
-end
-
 local function isGateOption(option)
     return option
         and option.Kind == "Raid"
@@ -997,14 +1007,31 @@ local function isGateOption(option)
         and option.GateRank ~= nil
 end
 
-local function getGateOptionByRank(rank)
-    for _, option in ipairs(gamemodeOptions) do
-        if isGateOption(option) and tostring(option.GateRank) == tostring(rank) then
-            return option
-        end
+local function normalizeGateRank(rank)
+    if rank == nil then
+        return nil
+    end
+
+    local normalized = tostring(rank):upper()
+    if normalized == "A"
+        or normalized == "B"
+        or normalized == "C"
+        or normalized == "D"
+        or normalized == "E" then
+        return normalized
     end
 
     return nil
+end
+
+local function parseGateRank(text)
+    text = tostring(text or "")
+    return normalizeGateRank(
+        text:match("[Gg]ate%s+[Rr]ank%s*([ABCDEabcde])")
+            or text:match("[Rr]ank%s*([ABCDEabcde])")
+            or text:match("([ABCDEabcde])%s*[Rr]ank")
+            or text:match("[Gg]ate%s*([ABCDEabcde])")
+    )
 end
 
 local function markGateOccurrenceConsumed(option)
@@ -1027,7 +1054,9 @@ local function isGateRankSelected(rank)
         return getGamemodeSelection("Raid", "World5")
     end
 
-    return state.SelectedGamemodeIds["Raid:World5:" .. tostring(rank)] ~= false
+    local normalizedRank = normalizeGateRank(rank)
+    return normalizedRank ~= nil
+        and state.SelectedGamemodeIds["Raid:World5:" .. normalizedRank] ~= false
 end
 
 local function getGamemodePriority(option)
@@ -1062,8 +1091,8 @@ local function payloadMatchesGamemodeOption(payload, option)
     end
 
     if option.GateRank then
-        local rank = payload.GateRank or payload.Rank
-        return tostring(rank) == tostring(option.GateRank)
+        local rank = normalizeGateRank(payload.GateRank or payload.Rank)
+        return rank == normalizeGateRank(option.GateRank)
     end
 
     return true
@@ -1084,10 +1113,11 @@ end
 local function getArenaGamemodePriority(arenaInfo)
     local kind = arenaInfo and arenaInfo.RootInfo and arenaInfo.RootInfo.Kind
     local key = arenaInfo and arenaInfo.Arena and arenaInfo.Arena.Name
+    local optionKey = kind == "Raid" and isWorldFiveGateKey(key) and "World5" or key
     local bestPriority = 9999
 
     for _, option in ipairs(gamemodeOptions) do
-        if option.Kind == kind and option.Key == key and isGamemodeOptionSelected(option) then
+        if option.Kind == kind and option.Key == optionKey and isGamemodeOptionSelected(option) then
             bestPriority = math.min(bestPriority, getGamemodePriority(option))
         end
     end
@@ -1098,9 +1128,10 @@ end
 local function getArenaGamemodeOption(arenaInfo)
     local kind = arenaInfo and arenaInfo.RootInfo and arenaInfo.RootInfo.Kind
     local key = arenaInfo and arenaInfo.Arena and arenaInfo.Arena.Name
+    local optionKey = kind == "Raid" and isWorldFiveGateKey(key) and "World5" or key
 
     for _, option in ipairs(gamemodeOptions) do
-        if option.Kind == kind and option.Key == key then
+        if option.Kind == kind and option.Key == optionKey then
             return option
         end
     end
@@ -1671,7 +1702,7 @@ local function pollRaidGateState()
         return
     end
 
-    local gateRank = gateState.Rank and tostring(gateState.Rank) or nil
+    local gateRank = normalizeGateRank(gateState.Rank)
     local timeLeft = math.max(0, tonumber(gateState.TimeLeft) or 0)
 
     if gateState.IsOpen == true and gateRank then
@@ -1702,7 +1733,6 @@ local function pollRaidGateState()
             Name = ("Gate Rank %s"):format(tostring(gateState.Rank or "?")),
             GateRank = gateRank,
             Rank = gateRank,
-            GateTeleport = true,
         })
     else
         state.AvailableGamemodes["Raid:World5"] = nil
@@ -1716,11 +1746,12 @@ local function getNextJoinableGamemode()
         if isGamemodeOptionSelected(option)
             and getGamemodeSelection(option.Kind, option.Key)
             and not isGamemodePromptSuppressed(option) then
-            for key, entry in pairs(state.AvailableGamemodes) do
-                if entry.Kind == option.Kind
-                    and payloadMatchesGamemodeOption(entry.Payload, option)
-                    and not (option.Kind == "Raid" and option.Key == "World5" and not isGateRankSelected(entry.Payload.GateRank or entry.Payload.Rank)) then
-                    return key, entry.Payload
+            if not isGateOption(option) then
+                for key, entry in pairs(state.AvailableGamemodes) do
+                    if entry.Kind == option.Kind
+                        and payloadMatchesGamemodeOption(entry.Payload, option) then
+                        return key, entry.Payload
+                    end
                 end
             end
 
@@ -1936,114 +1967,41 @@ local function resumePendingGamemode(Library)
     return false
 end
 
-local function getWorldFiveRaidStation()
-    local worlds = workspace:FindFirstChild("Worlds")
-    local worldFive = worlds and worlds:FindFirstChild("5")
-    local systems = worldFive and worldFive:FindFirstChild("Systems")
-    return systems and systems:FindFirstChild("RaidStation")
-end
-
-local function resolveGateSpatial(instance)
-    if not instance then
-        return nil, nil
-    end
-
-    if instance:IsA("BasePart") then
-        return instance.CFrame, instance
-    elseif instance:IsA("Model") then
-        local ok, pivot = pcall(function()
-            return instance:GetPivot()
-        end)
-        local touchPart = instance.PrimaryPart or instance:FindFirstChildWhichIsA("BasePart", true)
-        return ok and pivot or nil, touchPart
-    elseif instance:IsA("Attachment") then
-        local parent = instance.Parent
-        return CFrame.new(instance.WorldPosition), parent and parent:IsA("BasePart") and parent or nil
-    elseif instance:IsA("ObjectValue") then
-        return resolveGateSpatial(instance.Value)
-    elseif instance:IsA("CFrameValue") then
-        return instance.Value, nil
-    elseif instance:IsA("Vector3Value") then
-        return CFrame.new(instance.Value), nil
-    end
-
-    return nil, nil
-end
-
-local function getActiveGateTarget()
-    local station = getWorldFiveRaidStation()
-    local activeGate = station and station:FindFirstChild("ActiveGate")
-    if not station or not activeGate then
-        return nil, nil, station
-    end
-
-    local gateCFrame, touchPart = resolveGateSpatial(activeGate)
-    if not gateCFrame and station:IsA("BasePart") then
-        gateCFrame = station.CFrame
-        touchPart = station
-    end
-
-    return gateCFrame, touchPart, station
-end
-
-local function fireGateTouch(rootPart, touchPart)
-    if typeof(firetouchinterest) ~= "function" or not rootPart or not touchPart or not touchPart:IsA("BasePart") then
-        return
-    end
-
-    pcall(function()
-        firetouchinterest(rootPart, touchPart, 0)
-        firetouchinterest(rootPart, touchPart, 1)
-    end)
-end
-
-local function enterActiveGate(option)
+local function confirmAutomaticGateTeleport(option)
     if not isGateOption(option) then
         return true
     end
 
     local started = os.clock()
-    local lastWaitingLogAt = 0
-    print(("[Potassium] Gate Rank %s YES pressed. Moving into Worlds[5].Systems.RaidStation.ActiveGate."):format(tostring(option.GateRank)))
+    print(("[Potassium] Gate Rank %s YES pressed. Waiting for the game's automatic teleport."):format(tostring(option.GateRank)))
 
     while state.Enabled
         and state.AutoDungeonRaidWanted
         and isGamemodeOptionSelected(option)
-        and os.clock() - started <= GATE_ENTRY_TIMEOUT do
+        and os.clock() - started <= GATE_JOIN_CONFIRM_TIMEOUT do
         local contextKind, contextKey = getCombatVisibilityContext()
-        if contextKind == "Raid" and contextKey == "World5" then
+        if contextKind == "Raid" and isWorldFiveGateKey(contextKey) then
             markGateOccurrenceConsumed(option)
-            print(("[Potassium] Confirmed Gate Rank %s entry via VisibilityContext Raid:World5."):format(tostring(option.GateRank)))
+            print(("[Potassium] Confirmed automatic Gate Rank %s teleport via VisibilityContext %s."):format(
+                tostring(option.GateRank),
+                tostring(contextKey)
+            ))
             return true
         end
 
-        local gateCFrame, touchPart, station = getActiveGateTarget()
-        if gateCFrame then
-            local rootPart = getCharacterRoot()
-            if rootPart then
-                rootPart.AssemblyLinearVelocity = Vector3.zero
-                rootPart.AssemblyAngularVelocity = Vector3.zero
-                rootPart.CFrame = gateCFrame
-                fireGateTouch(rootPart, touchPart)
-                if station ~= touchPart and station and station:IsA("BasePart") then
-                    fireGateTouch(rootPart, station)
-                end
-            end
-        elseif os.clock() - lastWaitingLogAt >= 2 then
-            lastWaitingLogAt = os.clock()
-            print("[Potassium] Waiting for RaidStation.ActiveGate to appear...")
-        end
-
-        task.wait(GATE_TOUCH_INTERVAL)
+        task.wait(0.1)
     end
 
     local contextKind, contextKey = getCombatVisibilityContext()
-    if contextKind == "Raid" and contextKey == "World5" then
+    if contextKind == "Raid" and isWorldFiveGateKey(contextKey) then
         markGateOccurrenceConsumed(option)
         return true
     end
 
-    warn(("[Potassium] Gate Rank %s entry was not confirmed within %ds; it will retry while the gate remains open."):format(tostring(option.GateRank), GATE_ENTRY_TIMEOUT))
+    warn(("[Potassium] Gate Rank %s automatic teleport was not confirmed within %ds."):format(
+        tostring(option.GateRank),
+        GATE_JOIN_CONFIRM_TIMEOUT
+    ))
     return false
 end
 
@@ -2054,6 +2012,10 @@ local function tryJoinGamemode(Library, payload)
     end
 
     if kind == "Raid" and payload.Key == "World5" and not isGateRankSelected(payload.GateRank or payload.Rank) then
+        return false
+    end
+
+    if kind == "Raid" and payload.Key == "World5" then
         return false
     end
 
@@ -2081,29 +2043,16 @@ local function tryJoinGamemode(Library, payload)
             bridge:Fire("Join", payload.Key)
         end
     elseif kind == "Raid" then
-        if payload.GateTeleport == true then
-            bridgeName = "RaidGateTeleport"
-            bridge = Library and Library.getBridge(bridgeName)
-            if bridge then
-                bridge:Fire(payload.Key)
+        bridgeName = "RaidJoin"
+        if payload.CreateFirst == true then
+            if createAndJoinRaid(Library, payload) then
                 state.LastGamemodeJoinAt = os.clock()
-                print(("[Potassium] Auto joining gate %s via %s."):format(tostring(payload.GateRank or payload.Rank or "?"), bridgeName))
-                local gateOption = getGamemodeOptionForPayload(payload)
-                    or getGateOptionByRank(payload.GateRank or payload.Rank or getSelectedGateRank())
-                return enterActiveGate(gateOption)
+                return true
             end
         else
-            bridgeName = "RaidJoin"
-            if payload.CreateFirst == true then
-                if createAndJoinRaid(Library, payload) then
-                    state.LastGamemodeJoinAt = os.clock()
-                    return true
-                end
-            else
-                bridge = Library and Library.getBridge(bridgeName)
-                if bridge then
-                    bridge:Fire("Join", payload.Key)
-                end
+            bridge = Library and Library.getBridge(bridgeName)
+            if bridge then
+                bridge:Fire("Join", payload.Key)
             end
         end
     elseif kind == "Defense" then
@@ -2134,12 +2083,12 @@ local function isGateRaidArena(arenaInfo)
         and arenaInfo.RootInfo
         and arenaInfo.RootInfo.Kind == "Raid"
         and arenaInfo.Arena
-        and arenaInfo.Arena.Name == "World5"
+        and isWorldFiveGateKey(arenaInfo.Arena.Name)
 end
 
 local function isGateRaidContextActive()
     local contextKind, contextKey = getCombatVisibilityContext()
-    return contextKind == "Raid" and contextKey == "World5"
+    return contextKind == "Raid" and isWorldFiveGateKey(contextKey)
 end
 
 local function clearGateCompletionState()
@@ -2219,7 +2168,7 @@ local function setupRaidLifecycleWatchers(Library)
                 state.LatestRaidStateAt = os.clock()
                 state.LatestRaidContextKey = contextKind == "Raid" and contextKey or nil
 
-                if contextKind ~= "Raid" or contextKey ~= "World5" then
+                if contextKind ~= "Raid" or not isWorldFiveGateKey(contextKey) then
                     return
                 end
 
@@ -2257,7 +2206,7 @@ local function setupRaidLifecycleWatchers(Library)
     if not state.WatchedRaidLifecycleBridges.RaidEnded then
         if raidEndedBridge then
             addConnection(raidEndedBridge:Connect(function()
-                if state.LatestRaidContextKey == "World5" or state.GateCompletionReady then
+                if isWorldFiveGateKey(state.LatestRaidContextKey) or state.GateCompletionReady then
                     print("[Potassium] Gate RaidEnded received; normal routing can resume.")
                 end
                 clearGateCompletionState()
@@ -2417,8 +2366,7 @@ local function getVisibleGamemodeCards()
         local yes = actions and actions:FindFirstChild("YES")
         local description = card:FindFirstChild("Description")
         local descriptionText = description and description:IsA("TextLabel") and description.Text or ""
-        local gateRank = descriptionText:match("[Gg]ate%s+[Rr]ank%s*([EDCB])")
-            or descriptionText:match("[Rr]ank%s*([EDCB])")
+        local gateRank = parseGateRank(descriptionText)
 
         if kind and yes and yes:IsA("GuiButton") then
             if kind == "Raid" and payload.Key == "World5" and gateRank then
@@ -2545,7 +2493,7 @@ local function pressExactGamemodeNotifyYes(option)
         print(("[Potassium] Pressed %s.Actions.YES."):format(cardName))
 
         if isGateOption(option) then
-            return enterActiveGate(option)
+            return confirmAutomaticGateTeleport(option)
         end
 
         return true
@@ -2576,10 +2524,9 @@ getExactGamemodeNotifyButton = function(option)
     if option.Kind == "Raid" and option.Key == "World5" and option.GateRank then
         local description = card:FindFirstChild("Description")
         local descriptionText = description and description:IsA("TextLabel") and description.Text or ""
-        local rank = descriptionText:match("[Gg]ate%s+[Rr]ank%s*([EDCB])")
-            or descriptionText:match("[Rr]ank%s*([EDCB])")
+        local rank = parseGateRank(descriptionText)
 
-        if tostring(rank) ~= tostring(option.GateRank) then
+        if rank ~= normalizeGateRank(option.GateRank) then
             return nil
         end
     end
@@ -2706,7 +2653,7 @@ local function handleExactGamemodePrompt(Library, option)
             print(("[Potassium] Watcher pressed %s.Actions.YES."):format(tostring(cardName)))
 
             if isGateOption(option) then
-                return enterActiveGate(option)
+                return confirmAutomaticGateTeleport(option)
             end
 
             if requiresPriorityJoinConfirmation(option) then
@@ -2782,7 +2729,7 @@ local function pressVisibleGamemodeYes(Library)
                 print(("[Potassium] Pressed YES for %s %s."):format(cardInfo.Kind, tostring(cardInfo.Payload.Key)))
 
                 if isGateOption(option) then
-                    return enterActiveGate(option)
+                    return confirmAutomaticGateTeleport(option)
                 end
 
                 if requiresPriorityJoinConfirmation(option) then
@@ -2871,7 +2818,7 @@ local function runDungeonRaidFarmCore()
 
         if not arenaInfo then
             local contextKind, contextKey = getCombatVisibilityContext()
-            local gateContextActive = contextKind == "Raid" and contextKey == "World5"
+            local gateContextActive = contextKind == "Raid" and isWorldFiveGateKey(contextKey)
 
             if gateContextActive then
                 ensureGateAutoArise(Library)
@@ -2895,7 +2842,20 @@ local function runDungeonRaidFarmCore()
                 continue
             end
 
-            if state.GateCompletionReady and not (contextKind == "Raid" and contextKey == "World5") then
+            if contextKind and contextKey then
+                currentTarget = nil
+                currentTargetHealth = nil
+                observedLiveSet = {}
+                lastArenaKey = nil
+                lastKillAt = os.clock()
+                lastArenaRoom = nil
+                waitingForMobSpawn = false
+                hideAll()
+                task.wait(0.25)
+                continue
+            end
+
+            if state.GateCompletionReady and not (contextKind == "Raid" and isWorldFiveGateKey(contextKey)) then
                 clearGateCompletionState()
             end
 
@@ -2990,7 +2950,7 @@ local function runDungeonRaidFarmCore()
         if arenaInfo.Key ~= lastArenaKey then
             print(("[Potassium] Dungeon/Raid farm attached to %s."):format(arenaInfo.Key))
             if isGateRaidArena(arenaInfo) then
-                print("[Potassium] Gate session locked: generic timeout and priority preemption are disabled until 50/50 or RaidEnded.")
+                print(("[Potassium] Gate session locked against priority preemption; the universal %ds live-mob timeout remains active."):format(UNIVERSAL_COMBAT_TIMEOUT))
             end
             currentTarget = nil
             currentTargetHealth = nil
@@ -3079,9 +3039,7 @@ local function runDungeonRaidFarmCore()
             continue
         end
 
-        local timeoutLimit = isGateRaidArena(arenaInfo)
-            and math.huge
-            or (#liveEnemies == 0 and WAVE_TRANSITION_TIMEOUT or mobTimeout)
+        local timeoutLimit = #liveEnemies == 0 and WAVE_TRANSITION_TIMEOUT or mobTimeout
 
         if os.clock() - lastKillAt > timeoutLimit then
             handleArenaTimeout(Library, arenaInfo, ("No combat progress for %ds"):format(timeoutLimit))
