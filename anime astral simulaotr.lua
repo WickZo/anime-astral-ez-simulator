@@ -32,6 +32,8 @@ local WORLD_CHANGE_TIMEOUT = 12
 local TARGET_FIND_TIMEOUT = 8
 local TARGET_DEATH_TIMEOUT = 45
 local TARGET_SEARCH_RADIUS = 5000
+local WORLD_ROUTE_CYCLE_DELAY = 0.25
+local SINGLE_BOSS_RESPAWN_POLL_INTERVAL = 0.5
 local UNIVERSAL_COMBAT_TIMEOUT = 6
 local WAVE_TRANSITION_TIMEOUT = 30
 local GATE_FINAL_WAVE = 50
@@ -427,6 +429,7 @@ if getgenv then
 end
 
 local settingsSavePending = false
+local settingsSaveGeneration = 0
 
 local function cloneBooleanSettings(source)
     local result = {}
@@ -492,7 +495,13 @@ local function queueSettingsSave()
     end
 
     settingsSavePending = true
+    settingsSaveGeneration += 1
+    local generation = settingsSaveGeneration
     task.delay(0.2, function()
+        if generation ~= settingsSaveGeneration or not state.Enabled then
+            return
+        end
+
         settingsSavePending = false
         saveSettingsNow()
     end)
@@ -504,6 +513,8 @@ local function addConnection(connection)
 end
 
 function state:Disconnect()
+    settingsSaveGeneration += 1
+    settingsSavePending = false
     saveSettingsNow()
     self.Enabled = false
     self.RouteRunning = false
@@ -3336,7 +3347,36 @@ local function runLocationRoute()
         return
     end
 
-    local function runSelectedLocation(location)
+    local function waitForSingleBossRespawn(location)
+        print(("[Potassium] %s is down. Waiting for its next spawn."):format(location.Name))
+
+        while state.Enabled
+            and state.RouteRunning
+            and state.SelectedLocations[location.Name] ~= false do
+            local canResume, interrupted = waitForWorldRouteResume()
+            if not canResume then
+                return false
+            elseif interrupted then
+                return true
+            end
+
+            local enemy = findTargetEnemy(location, false)
+            if enemy then
+                local health, _, dead = getEnemyHealth(enemy)
+                if not dead and type(health) == "number" and health > 0 then
+                    print(("[Potassium] %s respawned. Resuming the route."):format(location.Name))
+                    return false
+                end
+            end
+
+            hideAll()
+            task.wait(SINGLE_BOSS_RESPAWN_POLL_INTERVAL)
+        end
+
+        return false
+    end
+
+    local function runSelectedLocation(location, selectedCount)
         local canResume, interrupted = waitForWorldRouteResume()
         if not canResume then
             return false
@@ -3387,12 +3427,27 @@ local function runLocationRoute()
 
         print(("[Potassium] Teleporting to %s."):format(location.Name))
         moveCharacterTo(location.Position)
-        local _, targetInterrupted = waitForTargetDeath(location)
-        return targetInterrupted == true
+        local targetDied, targetInterrupted = waitForTargetDeath(location)
+        if targetInterrupted then
+            return true
+        end
+
+        if targetDied and selectedCount <= 1 then
+            return waitForSingleBossRespawn(location)
+        end
+
+        return false
     end
 
     while state.Enabled and state.RouteRunning do
         local ranAny = false
+        local selectedCount = 0
+
+        for _, location in ipairs(locations) do
+            if state.SelectedLocations[location.Name] ~= false then
+                selectedCount += 1
+            end
+        end
 
         for _, location in ipairs(locations) do
             if not state.Enabled or not state.RouteRunning then
@@ -3406,7 +3461,7 @@ local function runLocationRoute()
             ranAny = true
             local interrupted
             repeat
-                interrupted = runSelectedLocation(location)
+                interrupted = runSelectedLocation(location, selectedCount)
             until not interrupted
                 or not state.Enabled
                 or not state.RouteRunning
@@ -3416,6 +3471,8 @@ local function runLocationRoute()
         if not ranAny then
             warn("[Potassium] No route locations are checked.")
             task.wait(0.5)
+        else
+            task.wait(WORLD_ROUTE_CYCLE_DELAY)
         end
     end
 
@@ -4583,5 +4640,5 @@ if restartDungeonFarmAfterReload then
     task.spawn(runDungeonRaidFarm)
 end
 
-task.delay(0.5, saveSettingsNow)
+queueSettingsSave()
 print("[Potassium] Loading hider and route GUI enabled.")
