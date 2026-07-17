@@ -27,14 +27,14 @@ end
 
 local savedSettings = loadSavedSettings()
 
-local WAIT_AT_LOCATION = 0.1
 local WORLD_CHANGE_TIMEOUT = 12
 local TARGET_FIND_TIMEOUT = 8
 local TARGET_DEATH_TIMEOUT = 45
-local TARGET_SEARCH_RADIUS = 5000
 local WORLD_ROUTE_CYCLE_DELAY = 0.25
 local SINGLE_BOSS_RESPAWN_POLL_INTERVAL = 0.5
-local UNIVERSAL_COMBAT_TIMEOUT = 6
+local DEFAULT_UNIVERSAL_COMBAT_TIMEOUT = 6
+local MIN_UNIVERSAL_COMBAT_TIMEOUT = 0.1
+local MAX_UNIVERSAL_COMBAT_TIMEOUT = 300
 local WAVE_TRANSITION_TIMEOUT = 30
 local GATE_FINAL_WAVE = 50
 local GATE_COMPLETION_RETURN_GRACE = 1.25
@@ -53,60 +53,113 @@ local PRIORITY_JOIN_AFTER_TITAN_LEAVE_DELAY = 2
 local PRIORITY_JOIN_CONFIRM_TIMEOUT = 8
 local PRIORITY_JOIN_RETRY_INTERVAL = 1
 local AUTO_EXCHANGE_INTERVAL = 0.3
+local AUTO_COLLECTOR_SCAN_INTERVAL = 0.25
+local AUTO_COLLECTOR_PROMPT_COOLDOWN = 1
+local AUTO_COLLECTOR_CONFIRM_TIMEOUT = 2
 local AUTO_START_ROUTE = false
 local GUI_FULL_HEIGHT = 600
+
+local function normalizeUniversalCombatTimeout(value)
+    local number = tonumber(value)
+    if type(number) ~= "number"
+        or number ~= number
+        or number == math.huge
+        or number == -math.huge then
+        number = DEFAULT_UNIVERSAL_COMBAT_TIMEOUT
+    end
+
+    number = math.clamp(number, MIN_UNIVERSAL_COMBAT_TIMEOUT, MAX_UNIVERSAL_COMBAT_TIMEOUT)
+    return math.floor(number * 10 + 0.5) / 10
+end
+
+local function formatTimeoutSeconds(value)
+    local number = normalizeUniversalCombatTimeout(value)
+    if number == math.floor(number) then
+        return tostring(math.floor(number))
+    end
+
+    return ("%.1f"):format(number)
+end
 
 local locations = {
     {
         Name = "Itache",
+        EnemyId = "Itachi",
         EnemyName = "Itache",
+        EnemyAliases = { "Itachi" },
         World = 1,
-        Position = Vector3.new(-288.58, 224.01, -1395.00),
     },
     {
         Name = "Broly",
+        EnemyId = "Broly",
         EnemyName = "Broly",
         World = 2,
-        Position = Vector3.new(3119.86, 731.89, -1963.69),
     },
     {
         Name = "White Beard",
+        EnemyId = "BarbaBranca",
         EnemyName = "White Beard",
-        EnemyAliases = { "WhiteBeard" },
+        EnemyAliases = { "WhiteBeard", "BarbaBranca" },
         World = 3,
-        Position = Vector3.new(1620.64, 19.30, 1385.31),
     },
     {
         Name = "Armored Titan",
+        EnemyId = "ArmoredTitan",
         EnemyName = "Armored Titan",
         EnemyAliases = { "ArmoredTitan" },
         World = 4,
-        Position = Vector3.new(-1473.33, 142.69, 3328.64),
     },
     {
         Name = "Beleon",
+        EnemyId = "Beleon",
         EnemyName = "Beleon",
         World = 5,
-        Position = Vector3.new(2593.31, 331.04, -1477.78),
     },
     {
         Name = "Kokushibo",
+        EnemyId = "Kokeshebo",
         EnemyName = "Kokushibo",
         EnemyAliases = { "Kokachibo", "Kokushibo", "Kokeshebo" },
         World = 6,
-        Position = Vector3.new(3631.51, 133.13, 4145.94),
     },
     {
         Name = "Lucies",
+        EnemyId = "Lucies",
         EnemyName = "Lucies",
         World = 7,
-        Position = Vector3.new(7590.57, -170.50, -430.24),
     },
     {
         Name = "Quinella",
+        EnemyId = "Quinella",
         EnemyName = "Quinella",
         World = 8,
-        Position = Vector3.new(8003.63, -85.05, -3847.23),
+    },
+    {
+        Name = "Sho",
+        EnemyId = "Sho",
+        EnemyName = "Sho",
+        World = 9,
+    },
+    {
+        Name = "Aiz",
+        EnemyId = "Aiz",
+        EnemyName = "Aiz",
+        World = 10,
+    },
+}
+
+local collectorOptions = {
+    {
+        Key = "Crow",
+        Name = "Slayer Crows",
+        World = 6,
+        ObjectText = "Crow",
+    },
+    {
+        Key = "Ball",
+        Name = "SAO Balls",
+        World = 8,
+        ObjectText = "Ball",
     },
 }
 
@@ -186,6 +239,11 @@ local gamemodeOptions = {
         Key = "World8",
         Name = "Beach Defense",
     },
+    {
+        Kind = "Raid",
+        Key = "World10",
+        Name = "Soul Raid",
+    },
 }
 
 local old = getgenv and getgenv().PotassiumHideLoading
@@ -209,6 +267,20 @@ local state = {
     DungeonFarmRunning = false,
     AutoDungeonRaidWanted = false,
     AutoExchangeLoopRunning = false,
+    AutoCollectorLoopRunning = false,
+    CollectorBusy = false,
+    CollectorStatus = "Idle",
+    CollectorClaimCount = 0,
+    CollectorClaimCounts = {
+        Crow = 0,
+        Ball = 0,
+    },
+    CollectorRecentClaims = {},
+    CollectorPromptAttempts = setmetatable({}, { __mode = "k" }),
+    SelectedCollectors = {
+        Crow = false,
+        Ball = false,
+    },
     ExchangeRecipeCursor = 1,
     TokenRecipeCursor = 1,
     SelectedExchangeRecipes = {},
@@ -219,11 +291,23 @@ local state = {
         Y = 210,
     },
     RouteGuiMinimized = false,
+    MainGuiPosition = {
+        X = 90,
+        Y = 210,
+    },
+    MainGuiMinimized = false,
+    MainGuiTab = "Route",
+    UniversalCombatTimeout = normalizeUniversalCombatTimeout(savedSettings.UniversalCombatTimeout),
     ExchangeGuiPosition = {
         X = 400,
         Y = 210,
     },
     ExchangeGuiMinimized = false,
+    CollectorGuiPosition = {
+        X = 748,
+        Y = 210,
+    },
+    CollectorGuiMinimized = false,
     LastExchangeWarningAt = 0,
     LastDungeonToggleAt = 0,
     LastGamemodeJoinAt = 0,
@@ -302,17 +386,44 @@ local function applySavedGuiState(source)
         state.RouteGuiPosition.Y = tonumber(source.RouteGuiPosition.Y) or state.RouteGuiPosition.Y
     end
 
+    local mainGuiPosition = type(source.MainGuiPosition) == "table"
+        and source.MainGuiPosition
+        or source.RouteGuiPosition
+    if type(mainGuiPosition) == "table" then
+        state.MainGuiPosition.X = tonumber(mainGuiPosition.X) or state.MainGuiPosition.X
+        state.MainGuiPosition.Y = tonumber(mainGuiPosition.Y) or state.MainGuiPosition.Y
+    end
+
     if type(source.ExchangeGuiPosition) == "table" then
         state.ExchangeGuiPosition.X = tonumber(source.ExchangeGuiPosition.X) or state.ExchangeGuiPosition.X
         state.ExchangeGuiPosition.Y = tonumber(source.ExchangeGuiPosition.Y) or state.ExchangeGuiPosition.Y
+    end
+
+    if type(source.CollectorGuiPosition) == "table" then
+        state.CollectorGuiPosition.X = tonumber(source.CollectorGuiPosition.X) or state.CollectorGuiPosition.X
+        state.CollectorGuiPosition.Y = tonumber(source.CollectorGuiPosition.Y) or state.CollectorGuiPosition.Y
     end
 
     if type(source.RouteGuiMinimized) == "boolean" then
         state.RouteGuiMinimized = source.RouteGuiMinimized
     end
 
+    if type(source.MainGuiMinimized) == "boolean" then
+        state.MainGuiMinimized = source.MainGuiMinimized
+    end
+
+    if source.MainGuiTab == "Route"
+        or source.MainGuiTab == "Exchange"
+        or source.MainGuiTab == "Collector" then
+        state.MainGuiTab = source.MainGuiTab
+    end
+
     if type(source.ExchangeGuiMinimized) == "boolean" then
         state.ExchangeGuiMinimized = source.ExchangeGuiMinimized
+    end
+
+    if type(source.CollectorGuiMinimized) == "boolean" then
+        state.CollectorGuiMinimized = source.CollectorGuiMinimized
     end
 end
 
@@ -321,6 +432,16 @@ if type(savedSettings) == "table" then
     copyBooleanSettings(state.SelectedArenaTypes, savedSettings.SelectedArenaTypes)
     copyBooleanSettings(state.SelectedExchangeRecipes, savedSettings.SelectedExchangeRecipes)
     copyBooleanSettings(state.SelectedTokenRecipes, savedSettings.SelectedTokenRecipes)
+    copyBooleanSettings(state.SelectedCollectors, savedSettings.SelectedCollectors)
+
+    if type(savedSettings.CollectorClaimCounts) == "table" then
+        state.CollectorClaimCounts.Crow = math.max(0, tonumber(savedSettings.CollectorClaimCounts.Crow) or 0)
+        state.CollectorClaimCounts.Ball = math.max(0, tonumber(savedSettings.CollectorClaimCounts.Ball) or 0)
+    end
+
+    if type(savedSettings.CollectorRecentClaims) == "table" then
+        state.CollectorRecentClaims = savedSettings.CollectorRecentClaims
+    end
 
     if type(savedSettings.ModeFilter) == "string" then
         state.ModeFilter = savedSettings.ModeFilter
@@ -335,6 +456,9 @@ end
 
 if type(old) == "table" then
     state.AutoDungeonRaidWanted = restartDungeonFarmAfterReload
+    state.UniversalCombatTimeout = normalizeUniversalCombatTimeout(
+        old.UniversalCombatTimeout or state.UniversalCombatTimeout
+    )
 
     if type(old.PendingResumeGamemode) == "table" then
         state.PendingResumeGamemode = old.PendingResumeGamemode
@@ -375,12 +499,25 @@ if type(old) == "table" then
         end
     end
 
+    copyBooleanSettings(state.SelectedCollectors, old.SelectedCollectors)
+
+    if type(old.CollectorClaimCounts) == "table" then
+        state.CollectorClaimCounts.Crow = math.max(0, tonumber(old.CollectorClaimCounts.Crow) or 0)
+        state.CollectorClaimCounts.Ball = math.max(0, tonumber(old.CollectorClaimCounts.Ball) or 0)
+    end
+
+    if type(old.CollectorRecentClaims) == "table" then
+        state.CollectorRecentClaims = old.CollectorRecentClaims
+    end
+
     if old.ExchangeCategoryFilter == "Token" then
         state.ExchangeCategoryFilter = "Token"
     end
 
     applySavedGuiState(old)
 end
+
+state.CollectorClaimCount = state.CollectorClaimCounts.Crow + state.CollectorClaimCounts.Ball
 
 local addingGateRankA = type(old) == "table"
     and type(old.GamemodePriority) == "table"
@@ -448,6 +585,7 @@ local function getSettingsSnapshot()
         Version = 1,
         RouteRunning = state.RouteRunning == true,
         AutoDungeonRaidWanted = state.AutoDungeonRaidWanted == true,
+        UniversalCombatTimeout = normalizeUniversalCombatTimeout(state.UniversalCombatTimeout),
         SelectedLocations = cloneBooleanSettings(state.SelectedLocations),
         SelectedArenaTypes = cloneBooleanSettings(state.SelectedArenaTypes),
         SelectedGamemodeIds = cloneBooleanSettings(state.SelectedGamemodeIds),
@@ -455,17 +593,34 @@ local function getSettingsSnapshot()
         ModeFilter = state.ModeFilter,
         SelectedExchangeRecipes = cloneBooleanSettings(state.SelectedExchangeRecipes),
         SelectedTokenRecipes = cloneBooleanSettings(state.SelectedTokenRecipes),
+        SelectedCollectors = cloneBooleanSettings(state.SelectedCollectors),
+        CollectorClaimCounts = {
+            Crow = state.CollectorClaimCounts.Crow,
+            Ball = state.CollectorClaimCounts.Ball,
+        },
+        CollectorRecentClaims = state.CollectorRecentClaims,
         ExchangeCategoryFilter = state.ExchangeCategoryFilter,
         RouteGuiPosition = {
             X = state.RouteGuiPosition.X,
             Y = state.RouteGuiPosition.Y,
         },
         RouteGuiMinimized = state.RouteGuiMinimized == true,
+        MainGuiPosition = {
+            X = state.MainGuiPosition.X,
+            Y = state.MainGuiPosition.Y,
+        },
+        MainGuiMinimized = state.MainGuiMinimized == true,
+        MainGuiTab = state.MainGuiTab,
         ExchangeGuiPosition = {
             X = state.ExchangeGuiPosition.X,
             Y = state.ExchangeGuiPosition.Y,
         },
         ExchangeGuiMinimized = state.ExchangeGuiMinimized == true,
+        CollectorGuiPosition = {
+            X = state.CollectorGuiPosition.X,
+            Y = state.CollectorGuiPosition.Y,
+        },
+        CollectorGuiMinimized = state.CollectorGuiMinimized == true,
     }
 end
 
@@ -521,9 +676,14 @@ function state:Disconnect()
     self.DungeonFarmRunning = false
     self.AutoDungeonRaidWanted = false
     self.AutoExchangeLoopRunning = false
+    self.AutoCollectorLoopRunning = false
+    self.CollectorBusy = false
     self.GamemodeActionBusy = false
     for _, child in ipairs(playerGui:GetChildren()) do
-        if child.Name == "PotassiumRouteGui" or child.Name == "PotassiumExchangeGui" then
+        if child.Name == "PotassiumRouteGui"
+            or child.Name == "PotassiumExchangeGui"
+            or child.Name == "PotassiumCollectorGui"
+            or child.Name == "PotassiumMainGui" then
             pcall(function()
                 child:Destroy()
             end)
@@ -810,24 +970,48 @@ local function moveCharacterTo(position)
     return true
 end
 
-local function shouldPauseWorldRouteForAutoJoin()
+local function isAutoJoinMovementActive(forCollector)
     if not state.AutoDungeonRaidWanted then
         return false
     end
 
-    if state.GamemodeActionBusy
-        or state.PendingResumeGamemode ~= nil
-        or os.clock() - (state.LastGamemodeJoinAt or 0) < PRIORITY_JOIN_CONFIRM_TIMEOUT then
+    if state.GamemodeActionBusy then
         return true
     end
 
     local context = player:GetAttribute("VisibilityContext")
-    local kind = type(context) == "string" and context:match("^([^:]+):") or nil
+    local kind, key
+    if type(context) == "string" then
+        kind, key = context:match("^([^:]+):(.+)$")
+    end
+
+    if forCollector then
+        if kind == "Dungeon" or kind == "Trial" or kind == "TimeTrial" then
+            return true
+        end
+
+        if kind == "Raid" then
+            return key == "World5" or tostring(key):sub(1, 7) == "World5_"
+        end
+
+        return false
+    end
+
+    if state.PendingResumeGamemode ~= nil
+        or os.clock() - (state.LastGamemodeJoinAt or 0) < PRIORITY_JOIN_CONFIRM_TIMEOUT then
+        return true
+    end
+
     return kind == "Dungeon"
         or kind == "Raid"
         or kind == "Trial"
         or kind == "TimeTrial"
         or kind == "Defense"
+end
+
+
+local function shouldPauseWorldRouteForAutoJoin()
+    return state.CollectorBusy or isAutoJoinMovementActive()
 end
 
 local function waitForWorldRouteResume()
@@ -838,7 +1022,7 @@ local function waitForWorldRouteResume()
 
     if not state.RoutePausedForAutoJoin then
         state.RoutePausedForAutoJoin = true
-        print("[Potassium] World Route paused while Auto Join owns movement.")
+        print("[Potassium] World Route paused while Auto Join/Collector owns movement.")
     end
 
     while state.Enabled and state.RouteRunning and shouldPauseWorldRouteForAutoJoin() do
@@ -848,7 +1032,7 @@ local function waitForWorldRouteResume()
 
     local canResume = state.Enabled and state.RouteRunning
     if canResume then
-        print("[Potassium] World Route resumed after Auto Join released movement.")
+        print("[Potassium] World Route resumed after movement was released.")
     end
     state.RoutePausedForAutoJoin = false
     return canResume, true
@@ -861,6 +1045,7 @@ end
 
 local function getTargetNames(location)
     local names = {
+        normalizeName(location.EnemyId or location.EnemyName or location.Name),
         normalizeName(location.EnemyName or location.Name),
         normalizeName(location.Name),
     }
@@ -952,7 +1137,7 @@ local function formatHealth(value)
     return tostring(math.floor(value))
 end
 
-local function findTargetEnemy(location, allowNearest)
+local function findTargetEnemy(location)
     local worlds = workspace:FindFirstChild("Worlds")
     local world = worlds and worlds:FindFirstChild(tostring(location.World))
     local enemies = world and world:FindFirstChild("Enemies")
@@ -962,27 +1147,21 @@ local function findTargetEnemy(location, allowNearest)
     end
 
     local targetNames = getTargetNames(location)
-    local bestEnemy
-    local bestDistance = math.huge
+    local character = player.Character
+    local characterRoot = character and character:FindFirstChild("HumanoidRootPart")
+    local characterPosition = characterRoot and characterRoot.Position
 
     for _, enemy in ipairs(enemies:GetDescendants()) do
         if isEnemyModel(enemy) then
             local modelPosition = getModelPosition(enemy)
-            local distance = modelPosition and (modelPosition - location.Position).Magnitude or math.huge
+            local distance = modelPosition and characterPosition
+                and (modelPosition - characterPosition).Magnitude
+                or -1
 
             if doesNameMatch(enemy.Name, targetNames) then
-                return enemy, distance, true
-            end
-
-            if distance <= TARGET_SEARCH_RADIUS and distance < bestDistance then
-                bestEnemy = enemy
-                bestDistance = distance
+                return enemy, distance
             end
         end
-    end
-
-    if allowNearest then
-        return bestEnemy, bestDistance, false
     end
 
     return nil
@@ -991,18 +1170,17 @@ end
 local function waitForTargetDeath(location)
     local enemy
     local distance
-    local exactMatch
     local findStarted = os.clock()
 
     repeat
         local canResume, interrupted = waitForWorldRouteResume()
         if not canResume then
-            return false, false
+            return false, false, false
         elseif interrupted then
-            return false, true
+            return false, true, false
         end
 
-        enemy, distance, exactMatch = findTargetEnemy(location, false)
+        enemy, distance = findTargetEnemy(location)
 
         if enemy then
             break
@@ -1013,21 +1191,23 @@ local function waitForTargetDeath(location)
     until not state.Enabled or not state.RouteRunning or os.clock() - findStarted > TARGET_FIND_TIMEOUT
 
     if not enemy then
-        enemy, distance, exactMatch = findTargetEnemy(location, true)
-        if enemy then
-            warn(("[Potassium] Could not find exact target for %s. Using nearest enemy fallback."):format(location.Name))
-        else
-            warn(("[Potassium] Could not find target HP for %s. Using fallback wait."):format(location.Name))
-            task.wait(WAIT_AT_LOCATION)
-            return false, false
-        end
+        warn(("[Potassium] Could not find the live world-boss model for %s."):format(location.Name))
+        return false, false, false
     end
 
+    local targetPosition = getModelPosition(enemy)
+    if not targetPosition then
+        warn(("[Potassium] %s has no usable model root/pivot."):format(location.Name))
+        return false, false, false
+    end
+
+    print(("[Potassium] Teleporting to live %s model at %s."):format(location.Name, tostring(targetPosition)))
+    moveCharacterTo(targetPosition)
+
     local health, maxHealth, dead = getEnemyHealth(enemy)
-    print(("[Potassium] Waiting for %s HP on %s (%s, %.1f studs). Current: %s/%s"):format(
+    print(("[Potassium] Waiting for %s HP on %s (%.1f studs). Current: %s/%s"):format(
         location.Name,
         enemy:GetFullName(),
-        exactMatch and "name match" or "nearest match",
         distance or -1,
         formatHealth(health),
         formatHealth(maxHealth)
@@ -1037,33 +1217,33 @@ local function waitForTargetDeath(location)
     while state.Enabled and state.RouteRunning do
         local canResume, interrupted = waitForWorldRouteResume()
         if not canResume then
-            return false, false
+            return false, false, true
         elseif interrupted then
-            return false, true
+            return false, true, true
         end
 
         if not enemy.Parent then
             print(("[Potassium] %s disappeared. Moving on."):format(location.Name))
-            return true, false
+            return true, false, true
         end
 
         health, maxHealth, dead = getEnemyHealth(enemy)
 
         if dead or (type(health) == "number" and health <= 0) then
             print(("[Potassium] %s is dead/HP is 0. Moving on."):format(location.Name))
-            return true, false
+            return true, false, true
         end
 
         if os.clock() - deathStarted > TARGET_DEATH_TIMEOUT then
             warn(("[Potassium] Timed out waiting for %s HP. Moving on."):format(location.Name))
-            return false, false
+            return false, false, true
         end
 
         hideAll()
         task.wait(0.1)
     end
 
-    return false, false
+    return false, false, true
 end
 
 local arenaRoots = {
@@ -1785,7 +1965,7 @@ local function waitAfterLeavingTitanForPriority(arenaInfo)
 end
 
 local function getCombatMobTimeout(arenaInfo)
-    return UNIVERSAL_COMBAT_TIMEOUT
+    return normalizeUniversalCombatTimeout(state.UniversalCombatTimeout)
 end
 
 local function isFireCityArena(arenaInfo)
@@ -1986,7 +2166,11 @@ local function getNextJoinableGamemode()
     cleanAvailableGamemodes()
 
     for _, option in ipairs(getGamemodeOptionsByPriority()) do
-        if isGamemodeOptionSelected(option)
+        local collectorOwnsMovement = state.CollectorBusy
+            and (option.Kind == "Defense" or (option.Kind == "Raid" and not isGateOption(option)))
+
+        if not collectorOwnsMovement
+            and isGamemodeOptionSelected(option)
             and getGamemodeSelection(option.Kind, option.Key)
             and not isGamemodePromptSuppressed(option) then
             if not isGateOption(option) then
@@ -2251,6 +2435,11 @@ end
 local function tryJoinGamemode(Library, payload)
     local kind = getGamemodeKind(payload)
     if not kind or not getGamemodeSelection(kind, payload.Key) then
+        return false
+    end
+
+    if state.CollectorBusy
+        and (kind == "Defense" or (kind == "Raid" and payload.Key ~= "World5")) then
         return false
     end
 
@@ -2789,7 +2978,11 @@ local function getExactSelectedGamemodeOption(maxPriorityExclusive)
 
     for _, option in ipairs(getGamemodeOptionsByPriority()) do
         local priority = getGamemodePriority(option)
-        if not maxPriorityExclusive or priority < maxPriorityExclusive then
+        local collectorOwnsMovement = state.CollectorBusy
+            and (option.Kind == "Defense" or (option.Kind == "Raid" and not isGateOption(option)))
+
+        if not collectorOwnsMovement
+            and (not maxPriorityExclusive or priority < maxPriorityExclusive) then
             local yesButton, _, card = getExactGamemodeNotifyButton(option)
             if yesButton and not isGamemodePromptSuppressed(option, card) then
                 return option
@@ -2849,6 +3042,11 @@ end
 
 local function handleExactGamemodePrompt(Library, option)
     if not option then
+        return false
+    end
+
+    if state.CollectorBusy
+        and (option.Kind == "Defense" or (option.Kind == "Raid" and not isGateOption(option))) then
         return false
     end
 
@@ -2937,6 +3135,10 @@ local function runExactGamemodePromptWatcher(Library)
 
             if yesButton
                 and not isGamemodePromptSuppressed(option, card)
+                and not (
+                    state.CollectorBusy
+                    and (option.Kind == "Defense" or (option.Kind == "Raid" and not isGateOption(option)))
+                )
                 and os.clock() - (lastPressedAt[pressKey] or 0) >= 1 then
                 if handleExactGamemodePrompt(Library, option) then
                     lastPressedAt[pressKey] = os.clock()
@@ -2965,7 +3167,12 @@ local function pressVisibleGamemodeYes(Library)
 
     for _, cardInfo in ipairs(cards) do
         local option = getGamemodeOptionForPayload(cardInfo.Payload)
-        if state.SelectedArenaTypes[cardInfo.Kind] ~= false
+        local collectorOwnsMovement = state.CollectorBusy
+            and option
+            and (option.Kind == "Defense" or (option.Kind == "Raid" and not isGateOption(option)))
+
+        if not collectorOwnsMovement
+            and state.SelectedArenaTypes[cardInfo.Kind] ~= false
             and getGamemodeSelection(cardInfo.Kind, cardInfo.Payload.Key)
             and option
             and not isGamemodePromptSuppressed(option, cardInfo.Card)
@@ -3117,11 +3324,22 @@ local function runDungeonRaidFarmCore()
 
             if state.GamemodeActionBusy then
                 task.wait(0.1)
-            elseif state.PendingResumeGamemode then
+            elseif state.PendingResumeGamemode and not state.CollectorBusy then
                 runGamemodeActionLocked("resume pending mode", function()
                     return resumePendingGamemode(Library)
                 end)
                 task.wait(0.5)
+            elseif state.CollectorBusy then
+                local openKey, payload = getNextJoinableGamemode()
+                if payload then
+                    state.AvailableGamemodes[openKey] = nil
+                    runGamemodeActionLocked("priority gamemode join during collection", function()
+                        return tryJoinGamemode(Library, payload)
+                    end)
+                    task.wait(1.25)
+                else
+                    task.wait(0.1)
+                end
             elseif runGamemodeActionLocked("visible gamemode prompt", function()
                 return pressVisibleGamemodeYes(Library)
             end) then
@@ -3141,6 +3359,23 @@ local function runDungeonRaidFarmCore()
             end
 
             hideAll()
+            continue
+        end
+
+        if state.CollectorBusy
+            and (
+                arenaInfo.RootInfo.Kind == "Defense"
+                or (arenaInfo.RootInfo.Kind == "Raid" and not isGateRaidArena(arenaInfo))
+            ) then
+            currentTarget = nil
+            currentTargetHealth = nil
+            observedLiveSet = {}
+            lastArenaKey = nil
+            lastKillAt = os.clock()
+            lastArenaRoom = nil
+            waitingForMobSpawn = false
+            hideAll()
+            task.wait(0.1)
             continue
         end
 
@@ -3197,7 +3432,9 @@ local function runDungeonRaidFarmCore()
         if arenaInfo.Key ~= lastArenaKey then
             print(("[Potassium] Dungeon/Raid farm attached to %s."):format(arenaInfo.Key))
             if isGateRaidArena(arenaInfo) then
-                print(("[Potassium] Gate session locked against priority preemption; the universal %ds live-mob timeout remains active."):format(UNIVERSAL_COMBAT_TIMEOUT))
+                print(("[Potassium] Gate session locked against priority preemption; the universal %ss live-mob timeout remains active."):format(
+                    formatTimeoutSeconds(getCombatMobTimeout(arenaInfo))
+                ))
             end
             currentTarget = nil
             currentTargetHealth = nil
@@ -3248,7 +3485,7 @@ local function runDungeonRaidFarmCore()
         elseif waitingForMobSpawn then
             waitingForMobSpawn = false
             lastKillAt = os.clock()
-            print(('[Potassium] Mob spawned; universal %ds kill timer started.'):format(mobTimeout))
+            print(('[Potassium] Mob spawned; universal %ss kill timer started.'):format(formatTimeoutSeconds(mobTimeout)))
         end
 
         if target and target ~= currentTarget then
@@ -3261,7 +3498,7 @@ local function runDungeonRaidFarmCore()
 
         if isFireCityArena(arenaInfo) and target and not isFireCityActuallyJoined(target) then
             if os.clock() - lastKillAt > mobTimeout then
-                handleArenaTimeout(Library, arenaInfo, ("Could not confirm Fire City join for %ds"):format(mobTimeout))
+                handleArenaTimeout(Library, arenaInfo, ("Could not confirm Fire City join for %ss"):format(formatTimeoutSeconds(mobTimeout)))
                 currentTarget = nil
                 currentTargetHealth = nil
                 observedLiveSet = {}
@@ -3289,7 +3526,7 @@ local function runDungeonRaidFarmCore()
         local timeoutLimit = #liveEnemies == 0 and WAVE_TRANSITION_TIMEOUT or mobTimeout
 
         if os.clock() - lastKillAt > timeoutLimit then
-            handleArenaTimeout(Library, arenaInfo, ("No combat progress for %ds"):format(timeoutLimit))
+            handleArenaTimeout(Library, arenaInfo, ("No combat progress for %ss"):format(formatTimeoutSeconds(timeoutLimit)))
             currentTarget = nil
             currentTargetHealth = nil
             observedLiveSet = {}
@@ -3389,7 +3626,7 @@ local function runLocationRoute()
                 return true
             end
 
-            local enemy = findTargetEnemy(location, false)
+            local enemy = findTargetEnemy(location)
             if enemy then
                 local health, _, dead = getEnemyHealth(enemy)
                 if not dead and type(health) == "number" and health > 0 then
@@ -3442,7 +3679,7 @@ local function runLocationRoute()
             task.wait(0.35)
 
             if currentWorld ~= location.World then
-                warn(("[Potassium] World %d did not load for %s; skipping its coordinates."):format(location.World, location.Name))
+                warn(("[Potassium] World %d did not load for %s; skipping its boss model."):format(location.World, location.Name))
                 return false
             end
         end
@@ -3454,14 +3691,12 @@ local function runLocationRoute()
             return true
         end
 
-        print(("[Potassium] Teleporting to %s."):format(location.Name))
-        moveCharacterTo(location.Position)
-        local targetDied, targetInterrupted = waitForTargetDeath(location)
+        local targetDied, targetInterrupted, targetFound = waitForTargetDeath(location)
         if targetInterrupted then
             return true
         end
 
-        if targetDied and selectedCount <= 1 then
+        if (targetDied or not targetFound) and selectedCount <= 1 then
             return waitForSingleBossRespawn(location)
         end
 
@@ -3508,6 +3743,313 @@ local function runLocationRoute()
     state.RouteRunning = false
     state.RoutePausedForAutoJoin = false
     print("[Potassium] Location route stopped.")
+end
+
+local collector = {}
+
+do
+local collectorRuntime
+
+local function hasAnyCollectorEnabled()
+    for _, option in ipairs(collectorOptions) do
+        if state.SelectedCollectors[option.Key] == true then
+            return true
+        end
+    end
+
+    return false
+end
+
+local function getCollectorPromptPosition(prompt)
+    local current = prompt and prompt.Parent
+
+    while current and current ~= workspace do
+        if current:IsA("BasePart") then
+            return current.Position
+        elseif current:IsA("Model") then
+            local position = getModelPosition(current)
+            if position then
+                return position
+            end
+        end
+
+        current = current.Parent
+    end
+
+    return nil
+end
+
+local function findCollectorPrompt(option)
+    local worlds = workspace:FindFirstChild("Worlds")
+    local world = worlds and worlds:FindFirstChild(tostring(option.World))
+    local liveRoot = workspace:FindFirstChild(option.Key == "Crow" and "World6Corvos" or "World8Balls")
+    local scanRoot = liveRoot or world
+    if not scanRoot then
+        return nil
+    end
+
+    local expectedObjectText = normalizeName(option.ObjectText)
+    local characterRoot = player.Character and player.Character:FindFirstChild("HumanoidRootPart")
+    local bestPrompt
+    local bestDistance = math.huge
+
+    for _, descendant in ipairs(scanRoot:GetDescendants()) do
+        if descendant:IsA("ProximityPrompt")
+            and descendant.Enabled
+            and normalizeName(descendant.ObjectText) == expectedObjectText then
+            local position = getCollectorPromptPosition(descendant)
+            local distance = position and characterRoot
+                and (position - characterRoot.Position).Magnitude
+                or 0
+
+            if distance < bestDistance then
+                bestPrompt = descendant
+                bestDistance = distance
+            end
+        end
+    end
+
+    return bestPrompt, bestDistance
+end
+
+local function getCollectorRuntime()
+    if collectorRuntime
+        and collectorRuntime.RequestChangeWorld
+        and collectorRuntime.WorldController then
+        return collectorRuntime
+    end
+
+    local okLibrary, Library = pcall(function()
+        return require(ReplicatedStorage:WaitForChild("SimpleWorld"):WaitForChild("Library"))
+    end)
+    local okController, WorldController = pcall(function()
+        return require(ReplicatedStorage.SimpleWorld.Library.Client.WorldController)
+    end)
+
+    if not okLibrary or not Library or not okController or not WorldController then
+        return nil
+    end
+
+    local requestChangeWorld = Library.getBridge("RequestChangeWorld")
+    if not requestChangeWorld then
+        return nil
+    end
+
+    collectorRuntime = {
+        Library = Library,
+        RequestChangeWorld = requestChangeWorld,
+        WorldController = WorldController,
+    }
+    return collectorRuntime
+end
+
+local function changeWorldForCollector(option)
+    local runtime = getCollectorRuntime()
+    if not runtime then
+        return false, "world bridge unavailable"
+    end
+
+    local currentWorld
+    pcall(function()
+        currentWorld = runtime.WorldController:GetCurrentWorld()
+    end)
+
+    if currentWorld == option.World then
+        return true
+    end
+
+    print(("[Potassium] Auto Collector switching to world %d for %s."):format(option.World, option.Name))
+    runtime.RequestChangeWorld:Fire(option.World)
+
+    local started = os.clock()
+    repeat
+        if isAutoJoinMovementActive(true) then
+            return false, "Auto Join claimed movement"
+        end
+
+        hideAll()
+        task.wait(0.1)
+        pcall(function()
+            currentWorld = runtime.WorldController:GetCurrentWorld()
+        end)
+    until currentWorld == option.World
+        or os.clock() - started > WORLD_CHANGE_TIMEOUT
+        or not state.Enabled
+
+    if currentWorld ~= option.World then
+        return false, "world change timed out"
+    end
+
+    task.wait(0.2)
+    return true
+end
+
+local function fireCollectorPrompt(prompt)
+    if typeof(fireproximityprompt) == "function" then
+        fireproximityprompt(prompt)
+        return true
+    end
+
+    prompt:InputHoldBegin()
+    task.wait(math.max(prompt.HoldDuration, 0.05))
+    prompt:InputHoldEnd()
+    return true
+end
+
+local function collectPrompt(option, initialPrompt)
+    state.CollectorBusy = true
+    state.CollectorStatus = "Claiming " .. option.ObjectText
+    task.wait(0.2)
+
+    local ok, result = pcall(function()
+        if isAutoJoinMovementActive(true) then
+            return false, "Auto Join claimed movement"
+        end
+
+        local runtime = getCollectorRuntime()
+        if not runtime then
+            return false, "collector runtime unavailable"
+        end
+
+        local arenaInfo = getActiveCombatArena()
+        if arenaInfo then
+            local kind = arenaInfo.RootInfo and arenaInfo.RootInfo.Kind
+            if kind == "Dungeon" or kind == "TimeTrial" or isGateRaidArena(arenaInfo) then
+                return false, "protected arena owns movement"
+            end
+
+            if kind == "Defense" then
+                rememberResumeGamemodeFromArena(arenaInfo)
+            end
+
+            if kind == "Raid" or kind == "Defense" then
+                state.CollectorStatus = "Leaving " .. tostring(kind)
+                if not leaveCombatArenaAndWait(runtime.Library, arenaInfo, "Auto Collector priority", 2, 3) then
+                    return false, "could not leave lower-priority arena"
+                end
+                task.wait(0.2)
+            end
+        end
+
+        local changed, changeError = changeWorldForCollector(option)
+        if not changed then
+            return false, changeError
+        end
+
+        local prompt = initialPrompt
+        local promptStarted = os.clock()
+        repeat
+            prompt = findCollectorPrompt(option) or (prompt and prompt.Parent and prompt)
+            if prompt and prompt.Parent then
+                break
+            end
+            task.wait(0.05)
+        until os.clock() - promptStarted > AUTO_COLLECTOR_CONFIRM_TIMEOUT
+
+        if not prompt or not prompt.Parent or not prompt.Enabled then
+            return false, "prompt disappeared"
+        end
+
+        if isAutoJoinMovementActive(true) then
+            return false, "Auto Join claimed movement"
+        end
+
+        local position = getCollectorPromptPosition(prompt)
+        if not position then
+            return false, "prompt position unavailable"
+        end
+
+        if not moveCharacterTo(position) then
+            return false, "character root unavailable"
+        end
+
+        task.wait(0.1)
+        if isAutoJoinMovementActive(true) then
+            return false, "Auto Join claimed movement"
+        end
+
+        state.CollectorPromptAttempts[prompt] = os.clock()
+        fireCollectorPrompt(prompt)
+        print(("[Potassium] Auto Collector fired %s at %s."):format(option.ObjectText, prompt:GetFullName()))
+
+        local confirmStarted = os.clock()
+        repeat
+            if not prompt.Parent or not prompt.Enabled then
+                state.CollectorClaimCount += 1
+                state.CollectorClaimCounts[option.Key] = (state.CollectorClaimCounts[option.Key] or 0) + 1
+                table.insert(state.CollectorRecentClaims, 1, {
+                    Type = option.Key,
+                    At = os.time(),
+                    Path = prompt:GetFullName(),
+                })
+                while #state.CollectorRecentClaims > 20 do
+                    table.remove(state.CollectorRecentClaims)
+                end
+                state.CollectorStatus = "Claimed " .. option.ObjectText
+                queueSettingsSave()
+                print(("[Potassium] Auto Collector claimed %s (Crow %d, Ball %d)."):format(
+                    option.ObjectText,
+                    state.CollectorClaimCounts.Crow,
+                    state.CollectorClaimCounts.Ball
+                ))
+                return true
+            end
+            task.wait(0.05)
+        until os.clock() - confirmStarted > AUTO_COLLECTOR_CONFIRM_TIMEOUT
+            or isAutoJoinMovementActive(true)
+
+        return false, "claim was not confirmed"
+    end)
+
+    state.CollectorBusy = false
+
+    if not ok then
+        state.CollectorStatus = "Collector error"
+        warn(("[Potassium] Auto Collector error: %s"):format(tostring(result)))
+        return false
+    end
+
+    local claimed = result == true
+    if not claimed then
+        state.CollectorStatus = hasAnyCollectorEnabled() and "Scanning" or "Off"
+    end
+    return claimed
+end
+
+function collector.runLoop()
+    if state.AutoCollectorLoopRunning then
+        return
+    end
+
+    state.AutoCollectorLoopRunning = true
+
+    while state.Enabled do
+        if not hasAnyCollectorEnabled() then
+            state.CollectorStatus = "Off"
+        elseif isAutoJoinMovementActive(true) then
+            state.CollectorStatus = "Waiting for Dungeon/Gate/Trial"
+        elseif not state.CollectorBusy then
+            state.CollectorStatus = "Scanning"
+
+            for _, option in ipairs(collectorOptions) do
+                if state.SelectedCollectors[option.Key] == true then
+                    local prompt = findCollectorPrompt(option)
+                    local lastAttempt = prompt and state.CollectorPromptAttempts[prompt] or 0
+
+                    if prompt and os.clock() - lastAttempt >= AUTO_COLLECTOR_PROMPT_COOLDOWN then
+                        collectPrompt(option, prompt)
+                        break
+                    end
+                end
+            end
+        end
+
+        task.wait(AUTO_COLLECTOR_SCAN_INTERVAL)
+    end
+
+    state.CollectorBusy = false
+    state.AutoCollectorLoopRunning = false
+end
 end
 
 local exchangeRuntime
@@ -4039,6 +4581,233 @@ local function buildExchangeGui()
     rows.Refresh()
 end
 
+function collector.buildGui()
+    local existing = playerGui:FindFirstChild("PotassiumCollectorGui")
+    if existing then
+        existing:Destroy()
+    end
+
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "PotassiumCollectorGui"
+    gui.ResetOnSpawn = false
+    gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    gui.DisplayOrder = 102
+    gui.Parent = playerGui
+
+    local frame = Instance.new("Frame")
+    frame.Name = "Main"
+    frame.Size = UDim2.fromOffset(292, 146)
+    frame.Position = UDim2.fromOffset(state.CollectorGuiPosition.X, state.CollectorGuiPosition.Y)
+    frame.BackgroundColor3 = Color3.fromRGB(22, 24, 31)
+    frame.BorderSizePixel = 0
+    frame.Active = true
+    frame.Parent = gui
+
+    local frameCorner = Instance.new("UICorner")
+    frameCorner.CornerRadius = UDim.new(0, 8)
+    frameCorner.Parent = frame
+
+    local frameStroke = Instance.new("UIStroke")
+    frameStroke.Color = Color3.fromRGB(55, 137, 121)
+    frameStroke.Thickness = 1
+    frameStroke.Parent = frame
+
+    local title = Instance.new("TextLabel")
+    title.Name = "Title"
+    title.Size = UDim2.new(1, -50, 0, 34)
+    title.Position = UDim2.fromOffset(12, 0)
+    title.BackgroundTransparency = 1
+    title.Font = Enum.Font.GothamBold
+    title.Text = "Auto Collector"
+    title.TextColor3 = Color3.fromRGB(245, 247, 255)
+    title.TextSize = 15
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.Parent = frame
+
+    local minimize = Instance.new("TextButton")
+    minimize.Name = "Minimize"
+    minimize.Size = UDim2.fromOffset(30, 26)
+    minimize.Position = UDim2.new(1, -36, 0, 4)
+    minimize.BackgroundColor3 = Color3.fromRGB(41, 47, 62)
+    minimize.BorderSizePixel = 0
+    minimize.Font = Enum.Font.GothamBold
+    minimize.Text = "-"
+    minimize.TextColor3 = Color3.fromRGB(245, 247, 255)
+    minimize.TextSize = 18
+    minimize.Parent = frame
+
+    local minimizeCorner = Instance.new("UICorner")
+    minimizeCorner.CornerRadius = UDim.new(0, 6)
+    minimizeCorner.Parent = minimize
+
+    local content = Instance.new("Frame")
+    content.Name = "Content"
+    content.Size = UDim2.new(1, -24, 1, -44)
+    content.Position = UDim2.fromOffset(12, 40)
+    content.BackgroundTransparency = 1
+    content.Parent = frame
+
+    local rows = {}
+    local status = Instance.new("TextLabel")
+    status.Name = "Status"
+    status.Size = UDim2.new(1, 0, 0, 22)
+    status.Position = UDim2.fromOffset(0, 68)
+    status.BackgroundTransparency = 1
+    status.Font = Enum.Font.Gotham
+    status.TextColor3 = Color3.fromRGB(190, 205, 235)
+    status.TextSize = 12
+    status.TextXAlignment = Enum.TextXAlignment.Left
+    status.Parent = content
+
+    local function makeCollectorRow(option, y)
+        local button = Instance.new("TextButton")
+        button.Name = option.Key .. "Toggle"
+        button.Size = UDim2.new(1, 0, 0, 28)
+        button.Position = UDim2.fromOffset(0, y)
+        button.BackgroundColor3 = Color3.fromRGB(41, 47, 62)
+        button.BorderSizePixel = 0
+        button.Text = ""
+        button.Parent = content
+
+        local buttonCorner = Instance.new("UICorner")
+        buttonCorner.CornerRadius = UDim.new(0, 6)
+        buttonCorner.Parent = button
+
+        local box = Instance.new("TextLabel")
+        box.Name = "Check"
+        box.Size = UDim2.fromOffset(30, 20)
+        box.Position = UDim2.fromOffset(4, 4)
+        box.BackgroundColor3 = Color3.fromRGB(18, 21, 29)
+        box.BorderSizePixel = 0
+        box.Font = Enum.Font.GothamBold
+        box.TextColor3 = Color3.fromRGB(120, 220, 145)
+        box.TextSize = 10
+        box.Parent = button
+
+        local boxCorner = Instance.new("UICorner")
+        boxCorner.CornerRadius = UDim.new(0, 5)
+        boxCorner.Parent = box
+
+        local label = Instance.new("TextLabel")
+        label.Name = "Label"
+        label.Size = UDim2.new(1, -46, 1, 0)
+        label.Position = UDim2.fromOffset(42, 0)
+        label.BackgroundTransparency = 1
+        label.Font = Enum.Font.GothamSemibold
+        label.Text = ("W%d  %s"):format(option.World, option.Name)
+        label.TextColor3 = Color3.fromRGB(245, 247, 255)
+        label.TextSize = 12
+        label.TextXAlignment = Enum.TextXAlignment.Left
+        label.Parent = button
+
+        button.MouseButton1Click:Connect(function()
+            state.SelectedCollectors[option.Key] = not (state.SelectedCollectors[option.Key] == true)
+            queueSettingsSave()
+        end)
+
+        rows[option.Key] = {
+            Button = button,
+            Box = box,
+        }
+    end
+
+    for index, option in ipairs(collectorOptions) do
+        makeCollectorRow(option, (index - 1) * 34)
+    end
+
+    local function updateStatus()
+        local selectedCount = 0
+        for _, option in ipairs(collectorOptions) do
+            local row = rows[option.Key]
+            local selected = state.SelectedCollectors[option.Key] == true
+            if selected then
+                selectedCount += 1
+            end
+            row.Box.Text = selected and "ON" or ""
+            row.Button.BackgroundColor3 = selected and Color3.fromRGB(38, 88, 72) or Color3.fromRGB(41, 47, 62)
+        end
+
+        if state.CollectorBusy then
+            status.Text = ("%s | C%d B%d"):format(
+                state.CollectorStatus,
+                state.CollectorClaimCounts.Crow,
+                state.CollectorClaimCounts.Ball
+            )
+        elseif selectedCount == 0 then
+            status.Text = "Collector OFF"
+        elseif isAutoJoinMovementActive(true) then
+            status.Text = "Waiting | Dungeon/Gate/Trial"
+        else
+            status.Text = ("Scanning %d/2 | C%d B%d"):format(
+                selectedCount,
+                state.CollectorClaimCounts.Crow,
+                state.CollectorClaimCounts.Ball
+            )
+        end
+    end
+
+    local minimized = state.CollectorGuiMinimized == true
+    content.Visible = not minimized
+    frame.Size = minimized and UDim2.fromOffset(292, 34) or UDim2.fromOffset(292, 146)
+    minimize.Text = minimized and "+" or "-"
+
+    minimize.MouseButton1Click:Connect(function()
+        minimized = not minimized
+        state.CollectorGuiMinimized = minimized
+        content.Visible = not minimized
+        frame.Size = minimized and UDim2.fromOffset(292, 34) or UDim2.fromOffset(292, 146)
+        minimize.Text = minimized and "+" or "-"
+        queueSettingsSave()
+    end)
+
+    local dragging = false
+    local dragStart
+    local frameStart
+
+    frame.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            frameStart = frame.Position
+
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                    state.CollectorGuiPosition.X = frame.Position.X.Offset
+                    state.CollectorGuiPosition.Y = frame.Position.Y.Offset
+                    queueSettingsSave()
+                end
+            end)
+        end
+    end)
+
+    addConnection(UserInputService.InputChanged:Connect(function(input)
+        if not dragging then
+            return
+        end
+
+        if input.UserInputType ~= Enum.UserInputType.MouseMovement and input.UserInputType ~= Enum.UserInputType.Touch then
+            return
+        end
+
+        local delta = input.Position - dragStart
+        frame.Position = UDim2.new(
+            frameStart.X.Scale,
+            frameStart.X.Offset + delta.X,
+            frameStart.Y.Scale,
+            frameStart.Y.Offset + delta.Y
+        )
+    end))
+
+    updateStatus()
+    task.spawn(function()
+        while state.Enabled and gui.Parent do
+            updateStatus()
+            task.wait(0.25)
+        end
+    end)
+end
+
 local function buildRouteGui()
     for _, child in ipairs(playerGui:GetChildren()) do
         if child.Name == "PotassiumRouteGui" then
@@ -4221,7 +4990,7 @@ local function buildRouteGui()
     local function makeRow(location, y)
         local button = Instance.new("TextButton")
         button.Name = location.Name:gsub("%s+", "")
-        button.Size = UDim2.new(1, 0, 0, 28)
+        button.Size = UDim2.new(1, 0, 0, 24)
         button.Position = UDim2.fromOffset(0, y)
         button.BackgroundColor3 = Color3.fromRGB(41, 47, 62)
         button.BorderSizePixel = 0
@@ -4234,13 +5003,13 @@ local function buildRouteGui()
 
         local box = Instance.new("TextLabel")
         box.Name = "Check"
-        box.Size = UDim2.fromOffset(24, 24)
+        box.Size = UDim2.fromOffset(20, 20)
         box.Position = UDim2.fromOffset(4, 2)
         box.BackgroundColor3 = Color3.fromRGB(18, 21, 29)
         box.BorderSizePixel = 0
         box.Font = Enum.Font.GothamBold
         box.TextColor3 = Color3.fromRGB(120, 220, 145)
-        box.TextSize = 16
+        box.TextSize = 14
         box.Parent = button
 
         local boxCorner = Instance.new("UICorner")
@@ -4255,7 +5024,7 @@ local function buildRouteGui()
         label.Font = Enum.Font.GothamSemibold
         label.Text = ("W%d  %s"):format(location.World, location.Name)
         label.TextColor3 = Color3.fromRGB(245, 247, 255)
-        label.TextSize = 13
+        label.TextSize = 12
         label.TextXAlignment = Enum.TextXAlignment.Left
         label.Parent = button
 
@@ -4273,7 +5042,7 @@ local function buildRouteGui()
     end
 
     for index, location in ipairs(locations) do
-        makeRow(location, 28 + ((index - 1) * 32))
+        makeRow(location, 28 + ((index - 1) * 25))
     end
 
     local arenaTitle = Instance.new("TextLabel")
@@ -4364,7 +5133,7 @@ local function buildRouteGui()
 
     modeList = Instance.new("ScrollingFrame")
     modeList.Name = "ModeList"
-    modeList.Size = UDim2.new(1, 0, 0, 114)
+    modeList.Size = UDim2.new(1, 0, 0, 104)
     modeList.Position = UDim2.fromOffset(0, 342)
     modeList.BackgroundTransparency = 1
     modeList.BorderSizePixel = 0
@@ -4515,8 +5284,8 @@ local function buildRouteGui()
 
     startButton = Instance.new("TextButton")
     startButton.Name = "StartStop"
-    startButton.Size = UDim2.new(1, 0, 0, 32)
-    startButton.Position = UDim2.fromOffset(0, 468)
+    startButton.Size = UDim2.new(1, 0, 0, 30)
+    startButton.Position = UDim2.fromOffset(0, 452)
     startButton.BackgroundColor3 = Color3.fromRGB(54, 82, 125)
     startButton.BorderSizePixel = 0
     startButton.Font = Enum.Font.GothamBold
@@ -4531,8 +5300,8 @@ local function buildRouteGui()
 
     dungeonButton = Instance.new("TextButton")
     dungeonButton.Name = "DungeonRaidToggle"
-    dungeonButton.Size = UDim2.new(1, 0, 0, 32)
-    dungeonButton.Position = UDim2.fromOffset(0, 506)
+    dungeonButton.Size = UDim2.new(1, 0, 0, 30)
+    dungeonButton.Position = UDim2.fromOffset(0, 488)
     dungeonButton.BackgroundColor3 = Color3.fromRGB(54, 82, 125)
     dungeonButton.BorderSizePixel = 0
     dungeonButton.Font = Enum.Font.GothamBold
@@ -4544,6 +5313,85 @@ local function buildRouteGui()
     local dungeonCorner = Instance.new("UICorner")
     dungeonCorner.CornerRadius = UDim.new(0, 6)
     dungeonCorner.Parent = dungeonButton
+
+    local timeoutLabel = Instance.new("TextLabel")
+    timeoutLabel.Name = "CombatTimeoutLabel"
+    timeoutLabel.Size = UDim2.fromOffset(140, 26)
+    timeoutLabel.Position = UDim2.fromOffset(0, 524)
+    timeoutLabel.BackgroundTransparency = 1
+    timeoutLabel.Font = Enum.Font.GothamSemibold
+    timeoutLabel.Text = "Combat timeout (s)"
+    timeoutLabel.TextColor3 = Color3.fromRGB(190, 205, 235)
+    timeoutLabel.TextSize = 11
+    timeoutLabel.TextXAlignment = Enum.TextXAlignment.Left
+    timeoutLabel.Parent = content
+
+    local timeoutMinus = Instance.new("TextButton")
+    timeoutMinus.Name = "CombatTimeoutMinus"
+    timeoutMinus.Size = UDim2.fromOffset(28, 26)
+    timeoutMinus.Position = UDim2.fromOffset(144, 524)
+    timeoutMinus.BackgroundColor3 = Color3.fromRGB(41, 47, 62)
+    timeoutMinus.BorderSizePixel = 0
+    timeoutMinus.Font = Enum.Font.GothamBold
+    timeoutMinus.Text = "-"
+    timeoutMinus.TextColor3 = Color3.fromRGB(245, 247, 255)
+    timeoutMinus.TextSize = 14
+    timeoutMinus.Parent = content
+
+    local timeoutMinusCorner = Instance.new("UICorner")
+    timeoutMinusCorner.CornerRadius = UDim.new(0, 5)
+    timeoutMinusCorner.Parent = timeoutMinus
+
+    local timeoutInput = Instance.new("TextBox")
+    timeoutInput.Name = "CombatTimeoutInput"
+    timeoutInput.Size = UDim2.fromOffset(54, 26)
+    timeoutInput.Position = UDim2.fromOffset(176, 524)
+    timeoutInput.BackgroundColor3 = Color3.fromRGB(24, 28, 38)
+    timeoutInput.BorderSizePixel = 0
+    timeoutInput.ClearTextOnFocus = false
+    timeoutInput.Font = Enum.Font.GothamBold
+    timeoutInput.Text = formatTimeoutSeconds(state.UniversalCombatTimeout)
+    timeoutInput.TextColor3 = Color3.fromRGB(165, 190, 230)
+    timeoutInput.TextSize = 12
+    timeoutInput.Parent = content
+
+    local timeoutInputCorner = Instance.new("UICorner")
+    timeoutInputCorner.CornerRadius = UDim.new(0, 5)
+    timeoutInputCorner.Parent = timeoutInput
+
+    local timeoutPlus = Instance.new("TextButton")
+    timeoutPlus.Name = "CombatTimeoutPlus"
+    timeoutPlus.Size = UDim2.fromOffset(32, 26)
+    timeoutPlus.Position = UDim2.fromOffset(234, 524)
+    timeoutPlus.BackgroundColor3 = Color3.fromRGB(41, 47, 62)
+    timeoutPlus.BorderSizePixel = 0
+    timeoutPlus.Font = Enum.Font.GothamBold
+    timeoutPlus.Text = "+"
+    timeoutPlus.TextColor3 = Color3.fromRGB(245, 247, 255)
+    timeoutPlus.TextSize = 14
+    timeoutPlus.Parent = content
+
+    local timeoutPlusCorner = Instance.new("UICorner")
+    timeoutPlusCorner.CornerRadius = UDim.new(0, 5)
+    timeoutPlusCorner.Parent = timeoutPlus
+
+    local function setUniversalCombatTimeout(value)
+        state.UniversalCombatTimeout = normalizeUniversalCombatTimeout(value)
+        timeoutInput.Text = formatTimeoutSeconds(state.UniversalCombatTimeout)
+        queueSettingsSave()
+    end
+
+    connectGuiButton(timeoutMinus, function()
+        setUniversalCombatTimeout(state.UniversalCombatTimeout - 1)
+    end)
+
+    connectGuiButton(timeoutPlus, function()
+        setUniversalCombatTimeout(state.UniversalCombatTimeout + 1)
+    end)
+
+    timeoutInput.FocusLost:Connect(function()
+        setUniversalCombatTimeout(timeoutInput.Text)
+    end)
 
     startButton.MouseButton1Click:Connect(function()
         if state.RouteRunning then
@@ -4657,9 +5505,276 @@ local function buildRouteGui()
     end)
 end
 
-buildRouteGui()
-buildExchangeGui()
+function collector.buildMainGui()
+    buildRouteGui()
+    buildExchangeGui()
+    collector.buildGui()
+
+    local existing = playerGui:FindFirstChild("PotassiumMainGui")
+    if existing then
+        existing:Destroy()
+    end
+
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "PotassiumMainGui"
+    gui.ResetOnSpawn = false
+    gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    gui.DisplayOrder = 103
+    gui.Parent = playerGui
+
+    local frame = Instance.new("Frame")
+    frame.Name = "Main"
+    frame.Size = UDim2.fromOffset(536, GUI_FULL_HEIGHT)
+    local viewportSize = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(1920, 1080)
+    local frameX = math.clamp(state.MainGuiPosition.X, 8, math.max(8, viewportSize.X - 544))
+    local frameY = math.clamp(state.MainGuiPosition.Y, 8, math.max(8, viewportSize.Y - GUI_FULL_HEIGHT - 8))
+    state.MainGuiPosition.X = frameX
+    state.MainGuiPosition.Y = frameY
+    frame.Position = UDim2.fromOffset(frameX, frameY)
+    frame.BackgroundColor3 = Color3.fromRGB(22, 24, 31)
+    frame.BorderSizePixel = 0
+    frame.Active = true
+    frame.Parent = gui
+
+    local frameCorner = Instance.new("UICorner")
+    frameCorner.CornerRadius = UDim.new(0, 8)
+    frameCorner.Parent = frame
+
+    local frameStroke = Instance.new("UIStroke")
+    frameStroke.Color = Color3.fromRGB(67, 95, 142)
+    frameStroke.Thickness = 1
+    frameStroke.Parent = frame
+
+    local title = Instance.new("TextLabel")
+    title.Name = "Title"
+    title.Size = UDim2.new(1, -54, 0, 34)
+    title.Position = UDim2.fromOffset(12, 0)
+    title.BackgroundTransparency = 1
+    title.Active = true
+    title.Font = Enum.Font.GothamBold
+    title.TextColor3 = Color3.fromRGB(245, 247, 255)
+    title.TextSize = 15
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.Parent = frame
+
+    local minimize = Instance.new("TextButton")
+    minimize.Name = "Minimize"
+    minimize.Size = UDim2.fromOffset(30, 26)
+    minimize.Position = UDim2.new(1, -36, 0, 4)
+    minimize.BackgroundColor3 = Color3.fromRGB(41, 47, 62)
+    minimize.BorderSizePixel = 0
+    minimize.Font = Enum.Font.GothamBold
+    minimize.TextColor3 = Color3.fromRGB(245, 247, 255)
+    minimize.TextSize = 18
+    minimize.Parent = frame
+
+    local minimizeCorner = Instance.new("UICorner")
+    minimizeCorner.CornerRadius = UDim.new(0, 6)
+    minimizeCorner.Parent = minimize
+
+    local sidebar = Instance.new("Frame")
+    sidebar.Name = "Sidebar"
+    sidebar.Size = UDim2.new(0, 142, 1, -44)
+    sidebar.Position = UDim2.fromOffset(12, 40)
+    sidebar.BackgroundColor3 = Color3.fromRGB(18, 20, 27)
+    sidebar.BorderSizePixel = 0
+    sidebar.ClipsDescendants = true
+    sidebar.Parent = frame
+
+    local sidebarCorner = Instance.new("UICorner")
+    sidebarCorner.CornerRadius = UDim.new(0, 6)
+    sidebarCorner.Parent = sidebar
+
+    local divider = Instance.new("Frame")
+    divider.Name = "Divider"
+    divider.Size = UDim2.new(0, 1, 1, -44)
+    divider.Position = UDim2.fromOffset(160, 40)
+    divider.BackgroundColor3 = Color3.fromRGB(52, 59, 74)
+    divider.BorderSizePixel = 0
+    divider.Parent = frame
+
+    local pageHost = Instance.new("Frame")
+    pageHost.Name = "Pages"
+    pageHost.Size = UDim2.new(1, -178, 1, -44)
+    pageHost.Position = UDim2.fromOffset(166, 40)
+    pageHost.BackgroundTransparency = 1
+    pageHost.ClipsDescendants = true
+    pageHost.Parent = frame
+
+    local tabDefinitions = {
+        { Key = "Route", Text = "World Route", SourceGui = "PotassiumRouteGui" },
+        { Key = "Exchange", Text = "Auto Exchange", SourceGui = "PotassiumExchangeGui" },
+        { Key = "Collector", Text = "Auto Collector", SourceGui = "PotassiumCollectorGui" },
+    }
+    local pages = {}
+    local tabs = {}
+
+    local function attachPage(definition, page)
+        local sourceGui = playerGui:FindFirstChild(definition.SourceGui)
+        local sourceMain = sourceGui and sourceGui:FindFirstChild("Main")
+        local sourceContent = sourceMain and sourceMain:FindFirstChild("Content")
+
+        if sourceContent then
+            sourceContent.Parent = page
+            sourceContent.Size = UDim2.fromScale(1, 1)
+            sourceContent.Position = UDim2.fromOffset(0, 0)
+            sourceContent.Visible = true
+        end
+
+        if sourceGui then
+            sourceGui.Enabled = false
+        end
+        if sourceMain then
+            sourceMain:Destroy()
+        end
+    end
+
+    for index, definition in ipairs(tabDefinitions) do
+        local page = Instance.new("Frame")
+        page.Name = definition.Key .. "Page"
+        page.Size = UDim2.fromScale(1, 1)
+        page.BackgroundTransparency = 1
+        page.Visible = false
+        page.Parent = pageHost
+        pages[definition.Key] = page
+
+        local button = Instance.new("TextButton")
+        button.Name = definition.Key .. "Tab"
+        button.Size = UDim2.new(1, -12, 0, 34)
+        button.Position = UDim2.fromOffset(6, 8 + ((index - 1) * 40))
+        button.BackgroundColor3 = Color3.fromRGB(26, 30, 40)
+        button.BorderSizePixel = 0
+        button.Text = ""
+        button.Parent = sidebar
+
+        local buttonCorner = Instance.new("UICorner")
+        buttonCorner.CornerRadius = UDim.new(0, 5)
+        buttonCorner.Parent = button
+
+        local indicator = Instance.new("Frame")
+        indicator.Name = "Active"
+        indicator.Size = UDim2.new(0, 3, 1, -8)
+        indicator.Position = UDim2.fromOffset(3, 4)
+        indicator.BackgroundColor3 = Color3.fromRGB(67, 190, 213)
+        indicator.BorderSizePixel = 0
+        indicator.Visible = false
+        indicator.Parent = button
+
+        local buttonLabel = Instance.new("TextLabel")
+        buttonLabel.Name = "Label"
+        buttonLabel.Size = UDim2.new(1, -24, 1, 0)
+        buttonLabel.Position = UDim2.fromOffset(18, 0)
+        buttonLabel.BackgroundTransparency = 1
+        buttonLabel.Font = Enum.Font.GothamSemibold
+        buttonLabel.Text = definition.Text
+        buttonLabel.TextColor3 = Color3.fromRGB(198, 207, 226)
+        buttonLabel.TextSize = 12
+        buttonLabel.TextXAlignment = Enum.TextXAlignment.Left
+        buttonLabel.Parent = button
+
+        tabs[definition.Key] = {
+            Button = button,
+            Indicator = indicator,
+            Label = buttonLabel,
+            Text = definition.Text,
+        }
+
+        attachPage(definition, page)
+    end
+
+    local function showPage(key, persist)
+        if not pages[key] then
+            key = "Route"
+        end
+
+        state.MainGuiTab = key
+        for pageKey, page in pairs(pages) do
+            local selected = pageKey == key
+            page.Visible = selected
+            tabs[pageKey].Indicator.Visible = selected
+            tabs[pageKey].Button.BackgroundColor3 = selected
+                and Color3.fromRGB(42, 57, 78)
+                or Color3.fromRGB(26, 30, 40)
+            tabs[pageKey].Label.TextColor3 = selected
+                and Color3.fromRGB(245, 247, 255)
+                or Color3.fromRGB(198, 207, 226)
+        end
+        title.Text = "Potassium | " .. tabs[key].Text
+
+        if persist then
+            queueSettingsSave()
+        end
+    end
+
+    for key, tab in pairs(tabs) do
+        tab.Button.MouseButton1Click:Connect(function()
+            showPage(key, true)
+        end)
+    end
+
+    local minimized = state.MainGuiMinimized == true
+    sidebar.Visible = not minimized
+    divider.Visible = not minimized
+    pageHost.Visible = not minimized
+    frame.Size = minimized and UDim2.fromOffset(536, 34) or UDim2.fromOffset(536, GUI_FULL_HEIGHT)
+    minimize.Text = minimized and "+" or "-"
+
+    minimize.MouseButton1Click:Connect(function()
+        minimized = not minimized
+        state.MainGuiMinimized = minimized
+        sidebar.Visible = not minimized
+        divider.Visible = not minimized
+        pageHost.Visible = not minimized
+        frame.Size = minimized and UDim2.fromOffset(536, 34) or UDim2.fromOffset(536, GUI_FULL_HEIGHT)
+        minimize.Text = minimized and "+" or "-"
+        queueSettingsSave()
+    end)
+
+    local dragging = false
+    local dragStart
+    local frameStart
+
+    title.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            frameStart = frame.Position
+
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                    state.MainGuiPosition.X = frame.Position.X.Offset
+                    state.MainGuiPosition.Y = frame.Position.Y.Offset
+                    queueSettingsSave()
+                end
+            end)
+        end
+    end)
+
+    addConnection(UserInputService.InputChanged:Connect(function(input)
+        if not dragging then
+            return
+        end
+
+        if input.UserInputType ~= Enum.UserInputType.MouseMovement and input.UserInputType ~= Enum.UserInputType.Touch then
+            return
+        end
+
+        local delta = input.Position - dragStart
+        frame.Position = UDim2.new(
+            frameStart.X.Scale,
+            frameStart.X.Offset + delta.X,
+            frameStart.Y.Scale,
+            frameStart.Y.Offset + delta.Y
+        )
+    end))
+
+    showPage(state.MainGuiTab, false)
+end
+
+collector.buildMainGui()
 task.spawn(runAutoExchangeLoop)
+task.spawn(collector.runLoop)
 
 if AUTO_START_ROUTE or restartRouteAfterReload then
     task.spawn(runLocationRoute)
