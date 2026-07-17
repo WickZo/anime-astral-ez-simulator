@@ -1169,18 +1169,41 @@ local function getArenaDistanceFromCharacter(enemies)
     return bestDistance
 end
 
+local function getCanonicalGamemodeKey(kind, key)
+    if type(key) ~= "string" then
+        return key
+    end
+
+    local bestKey = key
+    local bestLength = 0
+
+    for _, option in ipairs(gamemodeOptions) do
+        local optionKey = tostring(option.Key)
+        if option.Kind == kind
+            and (key == optionKey or key:sub(1, #optionKey + 1) == optionKey .. "_")
+            and #optionKey > bestLength then
+            bestKey = optionKey
+            bestLength = #optionKey
+        end
+    end
+
+    return bestKey
+end
+
 local function isWorldFiveGateKey(key)
     if type(key) ~= "string" then
         return false
     end
 
-    return key == "World5" or key:match("^World5_") ~= nil
+    return getCanonicalGamemodeKey("Raid", key) == "World5"
 end
 
 local function getGamemodeSelection(kind, key)
     if state.SelectedArenaTypes[kind] == false then
         return false
     end
+
+    key = getCanonicalGamemodeKey(kind, key)
 
     if kind == "Raid" and isWorldFiveGateKey(key) then
         for _, option in ipairs(gamemodeOptions) do
@@ -1195,7 +1218,7 @@ local function getGamemodeSelection(kind, key)
         return false
     end
 
-    return state.SelectedGamemodeIds[kind .. ":" .. key] ~= false
+    return state.SelectedGamemodeIds[kind .. ":" .. key] == true
 end
 
 local function setGamemodeSelection(kind, key, enabled)
@@ -1330,7 +1353,7 @@ end
 local function getArenaGamemodePriority(arenaInfo)
     local kind = arenaInfo and arenaInfo.RootInfo and arenaInfo.RootInfo.Kind
     local key = arenaInfo and arenaInfo.Arena and arenaInfo.Arena.Name
-    local optionKey = kind == "Raid" and isWorldFiveGateKey(key) and "World5" or key
+    local optionKey = getCanonicalGamemodeKey(kind, key)
     local bestPriority = 9999
 
     for _, option in ipairs(gamemodeOptions) do
@@ -1345,7 +1368,7 @@ end
 local function getArenaGamemodeOption(arenaInfo)
     local kind = arenaInfo and arenaInfo.RootInfo and arenaInfo.RootInfo.Kind
     local key = arenaInfo and arenaInfo.Arena and arenaInfo.Arena.Name
-    local optionKey = kind == "Raid" and isWorldFiveGateKey(key) and "World5" or key
+    local optionKey = getCanonicalGamemodeKey(kind, key)
 
     for _, option in ipairs(gamemodeOptions) do
         if option.Kind == kind and option.Key == optionKey then
@@ -1716,7 +1739,8 @@ local function waitForArenaToBecomeActive(kind, key, timeout)
 
     repeat
         local contextKind, contextKey = getCombatVisibilityContext()
-        if contextKind == kind and contextKey == key then
+        if contextKind == kind
+            and getCanonicalGamemodeKey(contextKind, contextKey) == getCanonicalGamemodeKey(kind, key) then
             return true
         end
 
@@ -1754,7 +1778,7 @@ local function waitAfterLeavingTitanForPriority(arenaInfo)
         and arenaInfo.RootInfo
         and arenaInfo.RootInfo.Kind == "Defense"
         and arenaInfo.Arena
-        and arenaInfo.Arena.Name == "World4" then
+        and getCanonicalGamemodeKey("Defense", arenaInfo.Arena.Name) == "World4" then
         print(("[Potassium] Waiting %.1fs after leaving Titan before joining priority mode."):format(PRIORITY_JOIN_AFTER_TITAN_LEAVE_DELAY))
         task.wait(PRIORITY_JOIN_AFTER_TITAN_LEAVE_DELAY)
     end
@@ -1769,12 +1793,13 @@ local function isFireCityArena(arenaInfo)
         and arenaInfo.RootInfo
         and arenaInfo.RootInfo.Kind == "Dungeon"
         and arenaInfo.Arena
-        and arenaInfo.Arena.Name == "World9Dungeon"
+        and getCanonicalGamemodeKey("Dungeon", arenaInfo.Arena.Name) == "World9Dungeon"
 end
 
 local function isFireCityActuallyJoined(target)
     local contextKind, contextKey = getCombatVisibilityContext()
-    if contextKind == "Dungeon" and contextKey == "World9Dungeon" then
+    if contextKind == "Dungeon"
+        and getCanonicalGamemodeKey(contextKind, contextKey) == "World9Dungeon" then
         return true
     end
 
@@ -2687,7 +2712,10 @@ local function isPriorityResumeArena(arenaInfo)
             and arenaInfo.RootInfo
             and arenaInfo.RootInfo.Kind == "TimeTrial"
             and arenaInfo.Arena
-            and (arenaInfo.Arena.Name == "Easy" or arenaInfo.Arena.Name == "Medium")
+            and (
+                getCanonicalGamemodeKey("TimeTrial", arenaInfo.Arena.Name) == "Easy"
+                or getCanonicalGamemodeKey("TimeTrial", arenaInfo.Arena.Name) == "Medium"
+            )
         )
 end
 
@@ -2791,7 +2819,8 @@ local function confirmPriorityGamemodeJoin(option)
         and state.AutoDungeonRaidWanted
         and os.clock() - started < PRIORITY_JOIN_CONFIRM_TIMEOUT do
         local contextKind, contextKey = getCombatVisibilityContext()
-        if contextKind == option.Kind and contextKey == option.Key then
+        if contextKind == option.Kind
+            and getCanonicalGamemodeKey(contextKind, contextKey) == option.Key then
             print(("[Potassium] Confirmed priority join: %s:%s."):format(option.Kind, option.Key))
             return true
         end
@@ -2838,7 +2867,7 @@ local function handleExactGamemodePrompt(Library, option)
         local currentPriority = arenaInfo and getArenaGamemodePriority(arenaInfo) or nil
         local sameArena = arenaInfo
             and arenaInfo.RootInfo.Kind == option.Kind
-            and arenaInfo.Arena.Name == option.Key
+            and getCanonicalGamemodeKey(arenaInfo.RootInfo.Kind, arenaInfo.Arena.Name) == option.Key
 
         if sameArena or (currentPriority and optionPriority >= currentPriority) then
             return false
